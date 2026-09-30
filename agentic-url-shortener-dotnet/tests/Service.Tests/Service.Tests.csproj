@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>AgenticUrlShortener.Service.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      System.Net.DisableIPv6 works around a sandbox egress quirk: the test
+      host's dual-mode IPv6 sockets are transparently redirected to the
+      egress proxy, which breaks the vstest <-> testhost channel. Disabling
+      IPv6 forces plain IPv4 loopback sockets. See docs/TESTING.md.
+    -->
+    <RuntimeHostConfigurationOption Include="System.Net.DisableIPv6" Value="true" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="8.0.11" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Service\Service.csproj" />
+  </ItemGroup>
+
+</Project>

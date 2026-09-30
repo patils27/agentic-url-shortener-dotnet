@@ -1,0 +1,39 @@
+# .NET build outputs
+bin/
+obj/
+out/
+publish/
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+
+# Test results
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+coverage*/
+
+# SQLite dev databases
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Run outputs (generated scenario runs) — kept out of version control
+runs/*/
+!runs/BUILD_LOG.md
+!runs/.gitkeep
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.user
+*.suo
+
+# SDK (project-local install lives in ~/workspace/.dotnet, never committed)
+.dotnet/
