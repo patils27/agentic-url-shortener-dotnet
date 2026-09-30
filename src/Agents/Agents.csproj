@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Orchestrator\Orchestrator.csproj" />
+    <InternalsVisibleTo Include="Orchestrator.Tests" />
   </ItemGroup>
 
 </Project>

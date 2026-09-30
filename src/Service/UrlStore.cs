@@ -179,6 +179,57 @@ CREATE TABLE IF NOT EXISTS idempotency (
     }
 
     // -- idempotency -----------------------------------------------------
+    /// <summary>Atomically create the URL and save its replay response across connections.</summary>
+    public (bool Created, string? Replay) CreateWithIdempotency(
+        string code, string url, string createdAt, string? expiresAt, string? key, string body)
+    {
+        lock (_lock)
+        {
+            if (key is null)
+                return (Create(code, url, createdAt, expiresAt), null);
+
+            // Acquire the write reservation before reading the key. A second connection
+            // waits here and then observes the committed replay instead of creating a URL.
+            using var transaction = Conn.BeginTransaction(deferred: false);
+            using var lookup = Conn.CreateCommand();
+            lookup.Transaction = transaction;
+            lookup.CommandText = "SELECT body FROM idempotency WHERE key = $key";
+            lookup.Parameters.AddWithValue("$key", key);
+            if (lookup.ExecuteScalar() is string saved)
+            {
+                transaction.Commit();
+                return (false, saved);
+            }
+
+            try
+            {
+                using var insert = Conn.CreateCommand();
+                insert.Transaction = transaction;
+                insert.CommandText = "INSERT INTO urls(code, url, created_at, expires_at) VALUES ($code, $url, $created, $expires)";
+                insert.Parameters.AddWithValue("$code", code);
+                insert.Parameters.AddWithValue("$url", url);
+                insert.Parameters.AddWithValue("$created", createdAt);
+                insert.Parameters.AddWithValue("$expires", (object?)expiresAt ?? DBNull.Value);
+                insert.ExecuteNonQuery();
+
+                using var save = Conn.CreateCommand();
+                save.Transaction = transaction;
+                save.CommandText = "INSERT INTO idempotency(key, body, created_at) VALUES ($key, $body, $created)";
+                save.Parameters.AddWithValue("$key", key);
+                save.Parameters.AddWithValue("$body", body);
+                save.Parameters.AddWithValue("$created", createdAt);
+                save.ExecuteNonQuery();
+                transaction.Commit();
+                return (true, null);
+            }
+            catch (SqliteException ex) when (ex.SqliteErrorCode == 19)
+            {
+                // Disposing the transaction rolls back both inserts on a collision.
+                return (false, null);
+            }
+        }
+    }
+
     public void SaveIdempotency(string key, string body, string createdAt)
     {
         lock (_lock)

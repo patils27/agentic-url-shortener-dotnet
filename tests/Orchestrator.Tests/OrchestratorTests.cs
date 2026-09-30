@@ -17,7 +17,7 @@ file sealed class OkAgent(List<string> log) : IAgent
     public string Name => "ok";
     public AgentResult Run(RunContext ctx, TaskNode task)
     {
-        log.Add(task.Id);
+        lock (log) log.Add(task.Id);
         return new AgentResult { Success = true, Notes = "ok" };
     }
 }
@@ -42,9 +42,9 @@ file sealed class SleepAgent(double seconds, List<(string, string, double)> even
     public string Name => "sleep";
     public AgentResult Run(RunContext ctx, TaskNode task)
     {
-        events.Add((task.Id, "start", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0));
+        lock (events) events.Add((task.Id, "start", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0));
         Thread.Sleep(TimeSpan.FromSeconds(seconds));
-        events.Add((task.Id, "end", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0));
+        lock (events) events.Add((task.Id, "end", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0));
         return new AgentResult { Success = true, Notes = "slept" };
     }
 }
@@ -56,8 +56,66 @@ file sealed class Denier() : ApprovalManager(auto: false)
                 Reason = "nope" };
 }
 
+file sealed class ResultAgent(Func<AgentResult> run) : IAgent
+{
+    public string Name => "result";
+    public AgentResult Run(RunContext ctx, TaskNode task) => run();
+}
+
 public sealed class OrchestratorTests
 {
+    [Fact]
+    public void UnsuccessfulResultRetriesAndRecovers()
+    {
+        var attempts = 0;
+        var dag = new Dag();
+        dag.AddTask(new TaskNode { Id = "t", Name = "t", Agent = "result", MaxRetries = 2, BackoffBase = 0 });
+        var (engine, _) = MakeEngine(dag, new()
+        {
+            ["result"] = new ResultAgent(() => new AgentResult { Success = ++attempts == 2, Notes = "try again" }),
+        });
+        Assert.Equal("succeeded", engine.Run()["status"]);
+        Assert.Equal(2, attempts);
+        Assert.Equal(1, engine.Metrics.Summary()["total_retries"]);
+    }
+
+    [Fact]
+    public void UnsuccessfulResultExhaustionRollsBackAndSkipsDependents()
+    {
+        var dag = new Dag();
+        dag.AddTask(new TaskNode { Id = "t", Name = "t", Agent = "result", MaxRetries = 2, BackoffBase = 0 });
+        dag.AddTask(new TaskNode { Id = "after", Name = "after", Agent = "result", Deps = new() { "t" } });
+        var (engine, _) = MakeEngine(dag, new()
+        {
+            ["result"] = new ResultAgent(() => new AgentResult { Success = false, Notes = "failed result" }),
+        });
+        var rolledBack = false;
+        engine.RegisterRollback("t", () => rolledBack = true);
+        Assert.Equal("failed", engine.Run()["status"]);
+        Assert.True(rolledBack);
+        Assert.Equal(2, dag.Tasks["t"].Attempts);
+        Assert.Equal(TaskStatus.RolledBack, dag.Tasks["t"].Status);
+        Assert.Equal(TaskStatus.Skipped, dag.Tasks["after"].Status);
+    }
+
+    [Fact]
+    public void FallbackPolicyViolationSafeStopsRun()
+    {
+        var dag = new Dag();
+        dag.AddTask(new TaskNode
+        {
+            Id = "t", Name = "t", Agent = "result", FallbackAgent = "denied", MaxRetries = 1,
+        });
+        var (engine, _) = MakeEngine(dag, new()
+        {
+            ["result"] = new ResultAgent(() => new AgentResult { Success = false }),
+            ["denied"] = new ResultAgent(() => throw new PolicyViolationException("fallback denied")),
+        });
+        Assert.Equal("stopped", engine.Run()["status"]);
+        Assert.Equal(1, engine.Metrics.PolicyDenials);
+        Assert.Contains(engine.Audit.Events, e => (string)e["event"]! == "safe_stop");
+    }
+
     private static (Engine engine, RunContext ctx) MakeEngine(
         Dag dag, Dictionary<string, IAgent> agents,
         int maxParallel = 4, ApprovalManager? approvals = null)
@@ -123,15 +181,13 @@ public sealed class OrchestratorTests
         dag.AddTask(new TaskNode { Id = "b", Name = "b", Agent = "sleep", Deps = new List<string> { "a" } });
         dag.AddTask(new TaskNode { Id = "c", Name = "c", Agent = "sleep", Deps = new List<string> { "a" } });
         var (engine, _) = MakeEngine(dag, agents, maxParallel: 2);
-        var t0 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
-        engine.Run();
-        var elapsed = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0 - t0;
+        Assert.Equal("succeeded", engine.Run()["status"]);
         var starts = events.Where(e => e.Item2 == "start").ToDictionary(e => e.Item1, e => e.Item3);
         var ends = events.Where(e => e.Item2 == "end").ToDictionary(e => e.Item1, e => e.Item3);
         // b and c overlapped: each started before the other finished
         Assert.True(starts["b"] < ends["c"] && starts["c"] < ends["b"]);
-        // waves are sequential (a alone, then b+c): parallel << 3 * 0.4s
-        Assert.True(elapsed < 1.1, $"elapsed {elapsed:F2}s was not parallel");
+        // Verify the barrier directly, without a machine-dependent elapsed-time limit.
+        Assert.True(ends["a"] <= starts["b"] && ends["a"] <= starts["c"]);
     }
 
     [Fact]

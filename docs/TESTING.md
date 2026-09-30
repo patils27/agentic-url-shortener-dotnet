@@ -34,19 +34,27 @@ orchestration framework):
 
 ## 2. What is covered
 
-**`ServiceTests` (12 tests):** health/readiness, create + redirect,
+**`ServiceTests` (23 cases):** health/readiness, create + redirect,
 click recording, analytics aggregation (totals, per-day,
 referrer/user-agent, `last_clicked_at`), idempotency (`Idempotency-Key`
 replay returns the same body), rate limiting (429 + `Retry-After`,
 health bypass), URL/alias validators, custom alias creation and
 409-on-conflict, expired-link → 410, list/delete lifecycle.
 
-**`OrchestratorTests` (12 tests):** DAG execution order, parallel wave
+Additional regression cases verify concurrent idempotency over HTTP and across
+SQLite connections, collision rollback, reserved aliases, and trusted-proxy
+handling for rate limiting and click IPs.
+
+**`OrchestratorTests` (15 tests):** DAG execution order, parallel wave
 overlap (real timing overlap, not just completion), gate blocking, retry
 recovery + metrics accounting, retry-exhaustion → rollback, fallback
 chain, policy-denial safe-stop, approval grant/deny paths, replan
 invalidation + subgraph re-run, content-hash drift detection, metrics
-JSON shape.
+JSON shape. Regression cases verify unsuccessful result retries/rollback and
+safe-stop on fallback policy violations.
+
+**`AgentTests` (2 tests):** simultaneous draining of large stdout/stderr streams
+and timeout handling for hung child processes.
 
 **Generated variant suites** (run inside scenario workspaces by the
 tester agent): v1 = 9 tests, v2 = 12 tests, smart health-only = 15,
@@ -61,7 +69,7 @@ export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 
 # From the repo root
 dotnet test AgenticUrlShortener.sln --nologo -v q
-# -> 24 passed (12 + 12), 0 failed
+# -> 40 passed (23 + 17), 0 failed
 ```
 
 **Environment quirk (important):** VSTest opens a dual-mode local socket

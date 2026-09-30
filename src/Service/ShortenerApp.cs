@@ -6,6 +6,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.HttpOverrides;
 
 namespace AgenticUrlShortener.Service;
 
@@ -43,10 +44,23 @@ public static class ShortenerApp
 
         var app = builder.Build();
 
+        var trustedProxies = app.Services.GetRequiredService<ServiceOptions>().TrustedProxies;
+        if (trustedProxies.Length > 0)
+        {
+            var forwarded = new ForwardedHeadersOptions
+            {
+                ForwardedHeaders = ForwardedHeaders.XForwardedFor,
+                ForwardLimit = 1,
+            };
+            forwarded.KnownProxies.Clear();
+            forwarded.KnownIPNetworks.Clear();
+            foreach (var proxy in trustedProxies)
+                forwarded.KnownProxies.Add(System.Net.IPAddress.Parse(proxy));
+            app.UseForwardedHeaders(forwarded);
+        }
+
         string ClientIp(HttpContext c) =>
-            c.Request.Headers.TryGetValue("X-Forwarded-For", out var fwd)
-                ? fwd.ToString().Split(',')[0].Trim()
-                : c.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+            c.Connection.RemoteIpAddress?.ToString() ?? "unknown";
 
         string? Referrer(HttpContext c) =>
             c.Request.Headers.TryGetValue("Referer", out var r) ? r.ToString() : null;
@@ -115,8 +129,6 @@ public static class ShortenerApp
                 {
                     return Results.Json(new { detail = exc.Message }, statusCode: 422);
                 }
-                if (store.Get(code) is not null)
-                    return Results.Json(new { detail = "custom alias already in use" }, statusCode: 409);
             }
             else
             {
@@ -136,8 +148,6 @@ public static class ShortenerApp
             string? expiresAt = null;
             if (body.ExpiresInDays is not null)
                 expiresAt = now.AddDays(body.ExpiresInDays.Value).ToString("o");
-            if (!store.Create(code, url, createdAt, expiresAt))
-                return Results.Json(new { detail = "custom alias already in use" }, statusCode: 409);
 
             var payload = new ShortUrlResponse
             {
@@ -154,9 +164,14 @@ public static class ShortenerApp
                     DictionaryKeyPolicy = JsonNamingPolicy.SnakeCaseLower,
                 });
 
-            // idempotency persistence
-            if (context.Request.Headers.TryGetValue("Idempotency-Key", out var keyValues2))
-                store.SaveIdempotency(keyValues2.ToString(), bodyJson, createdAt);
+            // The database transaction resolves concurrent requests with the same key.
+            var idempotencyKey = context.Request.Headers.TryGetValue("Idempotency-Key", out var keyValues2)
+                ? keyValues2.ToString() : null;
+            var result = store.CreateWithIdempotency(code, url, createdAt, expiresAt, idempotencyKey, bodyJson);
+            if (result.Replay is not null)
+                return Results.Json(JsonSerializer.Deserialize<JsonElement>(result.Replay), statusCode: 200);
+            if (!result.Created)
+                return Results.Json(new { detail = "custom alias already in use" }, statusCode: 409);
 
             return Results.Json(JsonSerializer.Deserialize<JsonElement>(bodyJson), statusCode: 201);
         });

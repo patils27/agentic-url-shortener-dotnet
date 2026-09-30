@@ -1,11 +1,12 @@
-// Service test suite (12 tests): full HTTP coverage of the URL shortener API
-// via WebApplicationFactory. Mirrors the Python test suite test-for-test.
+// HTTP coverage of the URL shortener API via WebApplicationFactory,
+// plus cross-connection storage regression tests.
 
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using AgenticUrlShortener.Service;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -16,9 +17,11 @@ namespace AgenticUrlShortener.Service.Tests;
 public sealed class ShortenerTestFactory : WebApplicationFactory<Program>
 {
     private readonly ServiceOptions _options;
+    private readonly IPAddress? _remoteIp;
 
-    public ShortenerTestFactory(ServiceOptions? options = null)
+    public ShortenerTestFactory(ServiceOptions? options = null, IPAddress? remoteIp = null)
     {
+        _remoteIp = remoteIp;
         _options = options ?? new ServiceOptions
         {
             DbPath = ":memory:",
@@ -30,12 +33,120 @@ public sealed class ShortenerTestFactory : WebApplicationFactory<Program>
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
-        builder.ConfigureServices(services => services.AddSingleton(_options));
+        builder.ConfigureServices(services =>
+        {
+            services.AddSingleton(_options);
+            if (_remoteIp is not null)
+                services.AddSingleton<IStartupFilter>(new RemoteIpFilter(_remoteIp));
+        });
     }
+}
+
+file sealed class RemoteIpFilter(IPAddress address) : IStartupFilter
+{
+    public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next) => app =>
+    {
+        app.Use((context, nextMiddleware) =>
+        {
+            context.Connection.RemoteIpAddress = address;
+            return nextMiddleware();
+        });
+        next(app);
+    };
 }
 
 public sealed class ServiceTests : IDisposable
 {
+    [Theory]
+    [InlineData(null)]
+    [InlineData("concurrent-alias")]
+    public async Task ConcurrentIdempotentRequestsCreateOneUrl(string? alias)
+    {
+        using var client = Client();
+        client.DefaultRequestHeaders.Add("Idempotency-Key", "concurrent-key");
+        var responses = await Task.WhenAll(Enumerable.Range(0, 20).Select(_ =>
+            client.PostAsJsonAsync("/api/urls", new { url = "https://example.com", custom_alias = alias })));
+        Assert.Single(responses, r => r.StatusCode == HttpStatusCode.Created);
+        Assert.All(responses, r => Assert.True(r.StatusCode is HttpStatusCode.Created or HttpStatusCode.OK));
+        var bodies = await Task.WhenAll(responses.Select(r => r.Content.ReadAsStringAsync()));
+        Assert.Single(bodies.Distinct());
+        Assert.Single(_factory.Services.GetRequiredService<UrlStore>().ListAll());
+        foreach (var response in responses) response.Dispose();
+    }
+
+    [Fact]
+    public async Task IdempotencyIsAtomicAcrossStoreConnections()
+    {
+        // Shared in-memory SQLite database: separate connections, no filesystem state.
+        var database = $"idempotency-{Guid.NewGuid():N};Mode=Memory;Cache=Shared";
+        var stores = new[] { new UrlStore(database), new UrlStore(database) };
+        foreach (var store in stores) Assert.Empty(store.ListAll());
+        using var barrier = new Barrier(2);
+        var results = await Task.WhenAll(stores.Select((store, index) => Task.Factory.StartNew(() =>
+        {
+            Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(10)));
+            return store.CreateWithIdempotency($"code{index}", "https://example.com", DateTime.UtcNow.ToString("o"),
+                null, "shared-key", $"response{index}");
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)));
+        Assert.Single(results, r => r.Created);
+        var replay = Assert.Single(results, r => r.Replay is not null).Replay;
+        var row = Assert.Single(stores[0].ListAll());
+        Assert.Equal("response" + row.Code[^1], replay);
+        Assert.Equal(replay, stores[1].GetIdempotency("shared-key"));
+    }
+
+    [Fact]
+    public void AliasCollisionDoesNotConsumeIdempotencyKey()
+    {
+        var store = _factory.Services.GetRequiredService<UrlStore>();
+        var now = DateTime.UtcNow.ToString("o");
+        Assert.True(store.Create("existing", "https://example.com", now));
+        Assert.Equal((false, (string?)null), store.CreateWithIdempotency(
+            "existing", "https://example.com/new", now, null, "new-key", "new-response"));
+        Assert.Null(store.GetIdempotency("new-key"));
+        Assert.Equal((true, (string?)null), store.CreateWithIdempotency(
+            "available", "https://example.com/new", now, null, "new-key", "new-response"));
+        Assert.Equal("new-response", store.GetIdempotency("new-key"));
+    }
+
+    [Theory]
+    [InlineData("health")]
+    [InlineData("HEALTH")]
+    [InlineData("ready")]
+    [InlineData("ReAdY")]
+    public async Task ReservedAliasesAreRejected(string alias)
+    {
+        var response = await Client().PostAsJsonAsync("/api/urls",
+            new { url = "https://example.com", custom_alias = alias });
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
+        Assert.Empty(_factory.Services.GetRequiredService<UrlStore>().ListAll());
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task ForwardedIpIsUsedOnlyForExplicitlyTrustedPeers(bool configured, bool trustedPeer)
+    {
+        var peer = trustedPeer ? "192.0.2.1" : "192.0.2.2";
+        using var factory = new ShortenerTestFactory(new ServiceOptions
+        {
+            DbPath = ":memory:", BaseUrl = "http://test", RateBurst = 1, RatePerMinute = 0.001,
+            TrustedProxies = configured ? new[] { "192.0.2.1" } : Array.Empty<string>(),
+        }, IPAddress.Parse(peer));
+        var store = factory.Services.GetRequiredService<UrlStore>();
+        store.Create("ip-test", "https://example.com", DateTime.UtcNow.ToString("o"));
+        using var client = factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+        using var first = new HttpRequestMessage(HttpMethod.Get, "/ip-test");
+        first.Headers.Add("X-Forwarded-For", "198.51.100.10");
+        Assert.Equal(HttpStatusCode.TemporaryRedirect, (await client.SendAsync(first)).StatusCode);
+        Assert.Equal(configured && trustedPeer ? "198.51.100.10" : peer, Assert.Single(store.ClicksFor("ip-test")).Ip);
+        using var second = new HttpRequestMessage(HttpMethod.Get, "/ip-test");
+        second.Headers.Add("X-Forwarded-For", "198.51.100.11");
+        Assert.Equal(configured && trustedPeer ? HttpStatusCode.TemporaryRedirect : HttpStatusCode.TooManyRequests,
+            (await client.SendAsync(second)).StatusCode);
+    }
+
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,

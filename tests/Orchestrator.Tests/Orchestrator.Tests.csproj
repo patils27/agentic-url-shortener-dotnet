@@ -21,6 +21,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Orchestrator\Orchestrator.csproj" />
+    <ProjectReference Include="..\..\src\Agents\Agents.csproj" />
   </ItemGroup>
 
 </Project>

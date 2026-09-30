@@ -41,9 +41,11 @@ public static class Codegen
     // =======================================================================
     // src/Shortener/ShortenerOptions.cs  (identical in v1 and v2)
     // =======================================================================
-    private const string ShortenerOptionsCs = @"// Service configuration. Values come from the environment:
-//   SHORTENER_DB, SHORTENER_BASE_URL,
-//   SHORTENER_RATE_PER_MINUTE / SHORTENER_RATE_BURST
+    private const string ShortenerOptionsCs = @"// Service configuration. Values come from the environment so tests and
+// operators can override them without code changes:
+//   SHORTENER_DB          SQLite path (default ""shortener.db""; "":memory:"" in tests)
+//   SHORTENER_BASE_URL    public base URL used to build short_url (default http://localhost:8000)
+//   SHORTENER_RATE_PER_MINUTE / SHORTENER_RATE_BURST  rate limiter tuning
 
 namespace Shortener;
 
@@ -53,6 +55,7 @@ public sealed class ShortenerOptions
     public string BaseUrl { get; set; } = ""http://localhost:8000"";
     public double RatePerMinute { get; set; } = 60.0;
     public int RateBurst { get; set; } = 10;
+    public string[] TrustedProxies { get; set; } = Array.Empty<string>();
 
     public static ShortenerOptions FromEnvironment() => new()
     {
@@ -62,6 +65,8 @@ public sealed class ShortenerOptions
                                         out var rpm) ? rpm : 60.0,
         RateBurst = int.TryParse(Environment.GetEnvironmentVariable(""SHORTENER_RATE_BURST""),
                                  out var burst) ? burst : 10,
+        TrustedProxies = (Environment.GetEnvironmentVariable(""SHORTENER_TRUSTED_PROXIES"") ?? """")
+            .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries),
     };
 }
 ";
@@ -126,7 +131,7 @@ public sealed record ClickRow(string Code, string Ts, string? Referrer, string? 
     // =======================================================================
     private const string ValidatorsCs = @"// Shared input validation helpers.
 //
-// Extracted from Program.cs during the brownfield refactor so that URL/alias
+// Extracted into a dedicated module (brownfield refactor) so that URL/alias
 // validation lives in one place and can be unit-tested independently of HTTP.
 
 using System.Text.RegularExpressions;
@@ -138,6 +143,7 @@ public static class Validators
     private static readonly Regex AliasRegex =
         new(@""^[A-Za-z0-9_-]{3,32}$"", RegexOptions.Compiled);
 
+    /// <summary>Validate and normalize a destination URL. Throws <see cref=""ArgumentException""/>.</summary>
     public static string ValidateUrl(string? url)
     {
         if (string.IsNullOrWhiteSpace(url))
@@ -150,10 +156,14 @@ public static class Validators
         return url;
     }
 
+    /// <summary>Validate a custom alias. Throws <see cref=""ArgumentException""/>.</summary>
     public static string ValidateAlias(string? alias)
     {
         if (string.IsNullOrEmpty(alias) || !AliasRegex.IsMatch(alias))
             throw new ArgumentException(""custom_alias must be 3-32 chars of [A-Za-z0-9_-]"");
+        if (alias.Equals(""health"", StringComparison.OrdinalIgnoreCase) ||
+            alias.Equals(""ready"", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException(""custom_alias is reserved for a service endpoint"");
         return alias;
     }
 }
@@ -206,8 +216,10 @@ CREATE TABLE IF NOT EXISTS idempotency (
         _dbPath = dbPath;
     }
 
+    // -- schema ----------------------------------------------------------
     private void Ensure()
     {
+        // Lazy connection: constructing the store never creates DB files.
         if (_initialized) return;
         lock (_lock)
         {
@@ -226,6 +238,8 @@ CREATE TABLE IF NOT EXISTS idempotency (
         get { Ensure(); return _conn!; }
     }
 
+    // -- urls ------------------------------------------------------------
+    /// <summary>Insert a short URL. Returns false on code collision.</summary>
     public bool Create(string code, string url, string createdAt, string? expiresAt = null)
     {
         lock (_lock)
@@ -241,7 +255,7 @@ CREATE TABLE IF NOT EXISTS idempotency (
                 cmd.ExecuteNonQuery();
                 return true;
             }
-            catch (SqliteException ex) when (ex.SqliteErrorCode == 19)
+            catch (SqliteException ex) when (ex.SqliteErrorCode == 19) // constraint violation
             {
                 return false;
             }
@@ -294,6 +308,7 @@ CREATE TABLE IF NOT EXISTS idempotency (
         }
     }
 
+    // -- clicks ----------------------------------------------------------
     public void RecordClick(string code, string ts, string? referrer, string? userAgent, string? ip)
     {
         lock (_lock)
@@ -335,6 +350,58 @@ CREATE TABLE IF NOT EXISTS idempotency (
             cmd.CommandText = ""SELECT COUNT(*) FROM clicks WHERE code = $code"";
             cmd.Parameters.AddWithValue(""$code"", code);
             return Convert.ToInt32(cmd.ExecuteScalar());
+        }
+    }
+
+    // -- idempotency -----------------------------------------------------
+    /// <summary>Atomically create the URL and save its replay response across connections.</summary>
+    public (bool Created, string? Replay) CreateWithIdempotency(
+        string code, string url, string createdAt, string? expiresAt, string? key, string body)
+    {
+        lock (_lock)
+        {
+            if (key is null)
+                return (Create(code, url, createdAt, expiresAt), null);
+
+            // Acquire the write reservation before reading the key. A second connection
+            // waits here and then observes the committed replay instead of creating a URL.
+            using var transaction = Conn.BeginTransaction(deferred: false);
+            using var lookup = Conn.CreateCommand();
+            lookup.Transaction = transaction;
+            lookup.CommandText = ""SELECT body FROM idempotency WHERE key = $key"";
+            lookup.Parameters.AddWithValue(""$key"", key);
+            if (lookup.ExecuteScalar() is string saved)
+            {
+                transaction.Commit();
+                return (false, saved);
+            }
+
+            try
+            {
+                using var insert = Conn.CreateCommand();
+                insert.Transaction = transaction;
+                insert.CommandText = ""INSERT INTO urls(code, url, created_at, expires_at) VALUES ($code, $url, $created, $expires)"";
+                insert.Parameters.AddWithValue(""$code"", code);
+                insert.Parameters.AddWithValue(""$url"", url);
+                insert.Parameters.AddWithValue(""$created"", createdAt);
+                insert.Parameters.AddWithValue(""$expires"", (object?)expiresAt ?? DBNull.Value);
+                insert.ExecuteNonQuery();
+
+                using var save = Conn.CreateCommand();
+                save.Transaction = transaction;
+                save.CommandText = ""INSERT INTO idempotency(key, body, created_at) VALUES ($key, $body, $created)"";
+                save.Parameters.AddWithValue(""$key"", key);
+                save.Parameters.AddWithValue(""$body"", body);
+                save.Parameters.AddWithValue(""$created"", createdAt);
+                save.ExecuteNonQuery();
+                transaction.Commit();
+                return (true, null);
+            }
+            catch (SqliteException ex) when (ex.SqliteErrorCode == 19)
+            {
+                // Disposing the transaction rolls back both inserts on a collision.
+                return (false, null);
+            }
         }
     }
 
@@ -491,6 +558,7 @@ public sealed class RateLimiter
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.HttpOverrides;
 using Shortener;
 
 var app = CreateApp(ShortenerOptions.FromEnvironment());
@@ -517,10 +585,23 @@ WebApplication CreateApp(ShortenerOptions? options = null)
 
     var app = builder.Build();
 
+    var trustedProxies = app.Services.GetRequiredService<ShortenerOptions>().TrustedProxies;
+    if (trustedProxies.Length > 0)
+    {
+        var forwarded = new ForwardedHeadersOptions
+        {
+            ForwardedHeaders = ForwardedHeaders.XForwardedFor,
+            ForwardLimit = 1,
+        };
+        forwarded.KnownProxies.Clear();
+        forwarded.KnownIPNetworks.Clear();
+        foreach (var proxy in trustedProxies)
+            forwarded.KnownProxies.Add(System.Net.IPAddress.Parse(proxy));
+        app.UseForwardedHeaders(forwarded);
+    }
+
     string ClientIp(HttpContext c) =>
-        c.Request.Headers.TryGetValue(""X-Forwarded-For"", out var fwd)
-            ? fwd.ToString().Split(',')[0].Trim()
-            : c.Connection.RemoteIpAddress?.ToString() ?? ""unknown"";
+        c.Connection.RemoteIpAddress?.ToString() ?? ""unknown"";
 
     string? Referrer(HttpContext c) =>
         c.Request.Headers.TryGetValue(""Referer"", out var r) ? r.ToString() : null;
@@ -583,8 +664,6 @@ WebApplication CreateApp(ShortenerOptions? options = null)
             {
                 return Results.Json(new { detail = exc.Message }, statusCode: 422);
             }
-            if (store.Get(code) is not null)
-                return Results.Json(new { detail = ""custom alias already in use"" }, statusCode: 409);
         }
         else
         {
@@ -603,8 +682,6 @@ WebApplication CreateApp(ShortenerOptions? options = null)
         string? expiresAt = null;
         if (body.ExpiresInDays is not null)
             expiresAt = now.AddDays(body.ExpiresInDays.Value).ToString(""o"");
-        if (!store.Create(code, url, createdAt, expiresAt))
-            return Results.Json(new { detail = ""custom alias already in use"" }, statusCode: 409);
 
         var payload = new ShortUrlResponse
         {
@@ -620,8 +697,14 @@ WebApplication CreateApp(ShortenerOptions? options = null)
             DictionaryKeyPolicy = JsonNamingPolicy.SnakeCaseLower,
         });
 
-        if (context.Request.Headers.TryGetValue(""Idempotency-Key"", out var keyValues2))
-            store.SaveIdempotency(keyValues2.ToString(), bodyJson, createdAt);
+        // The database transaction resolves concurrent requests with the same key.
+        var idempotencyKey = context.Request.Headers.TryGetValue(""Idempotency-Key"", out var keyValues2)
+            ? keyValues2.ToString() : null;
+        var result = store.CreateWithIdempotency(code, url, createdAt, expiresAt, idempotencyKey, bodyJson);
+        if (result.Replay is not null)
+            return Results.Json(JsonSerializer.Deserialize<JsonElement>(result.Replay), statusCode: 200);
+        if (!result.Created)
+            return Results.Json(new { detail = ""custom alias already in use"" }, statusCode: 409);
 
         return Results.Json(JsonSerializer.Deserialize<JsonElement>(bodyJson), statusCode: 201);
     });
@@ -1122,8 +1205,6 @@ public sealed class ServiceTests : IDisposable
             {
                 return Results.Json(new { detail = exc.Message }, statusCode: 422);
             }
-            if (store.Get(code) is not null)
-                return Results.Json(new { detail = ""custom alias already in use"" }, statusCode: 409);
         }
         else
         {

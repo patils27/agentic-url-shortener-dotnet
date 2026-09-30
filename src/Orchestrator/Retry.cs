@@ -112,6 +112,8 @@ public static class Retry
             }
             catch (Exception exc)
             {
+                if (fatalExceptions.Any(t => t.IsInstanceOfType(exc)))
+                    throw;
                 lastError = $"fallback failed: {exc.GetType().Name}: {exc.Message}";
             }
         }

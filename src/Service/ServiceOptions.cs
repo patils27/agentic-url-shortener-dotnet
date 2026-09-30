@@ -12,6 +12,7 @@ public sealed class ServiceOptions
     public string BaseUrl { get; set; } = "http://localhost:8000";
     public double RatePerMinute { get; set; } = 60.0;
     public int RateBurst { get; set; } = 10;
+    public string[] TrustedProxies { get; set; } = Array.Empty<string>();
 
     public static ServiceOptions FromEnvironment() => new()
     {
@@ -21,5 +22,7 @@ public sealed class ServiceOptions
                                         out var rpm) ? rpm : 60.0,
         RateBurst = int.TryParse(Environment.GetEnvironmentVariable("SHORTENER_RATE_BURST"),
                                  out var burst) ? burst : 10,
+        TrustedProxies = (Environment.GetEnvironmentVariable("SHORTENER_TRUSTED_PROXIES") ?? "")
+            .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries),
     };
 }

@@ -92,28 +92,18 @@ public sealed class TesterAgent : Agent
             psi.Environment["PATH"] = homeDotnet +
                 Path.PathSeparator + (psi.Environment["PATH"] ?? "");
 
-        using var proc = Process.Start(psi)
-            ?? throw new InvalidOperationException("could not start dotnet test");
-        var timeoutMs = (int)(task.TimeoutS * 1000);
-        if (!proc.WaitForExit(timeoutMs))
-        {
-            try { proc.Kill(entireProcessTree: true); } catch (Exception) { }
-            throw new TimeoutException(
-                $"dotnet test timed out after {task.TimeoutS}s");
-        }
-        var stdout = proc.StandardOutput.ReadToEnd();
-        var stderr = proc.StandardError.ReadToEnd();
+        var (exitCode, stdout, stderr) = RunProcess(psi, TimeSpan.FromSeconds(task.TimeoutS));
         var output = (stdout + "\n" + stderr);
         var tail = output.Length > 6000 ? output[^6000..] : output;
         var counts = ParseTestOutput(stdout);
         var ok = (int)counts["passed"]! > 0 &&
                  (int)counts["failed"]! == 0 &&
                  (int)counts["errors"]! == 0 &&
-                 proc.ExitCode == 0;
+                 exitCode == 0;
         var report = new Dictionary<string, object?>
         {
             ["test_project"] = testProject,
-            ["returncode"] = proc.ExitCode,
+            ["returncode"] = exitCode,
             ["passed"] = ok,
             ["counts"] = counts,
             ["output_tail"] = tail,
@@ -125,7 +115,7 @@ public sealed class TesterAgent : Agent
         Decide(ctx,
             $"test gate {(ok ? "PASSED" : "FAILED")}: {counts["passed"]} passed, " +
             $"{counts["failed"]} failed, {counts["errors"]} errors",
-            $"dotnet test executed against the workspace build; returncode={proc.ExitCode}",
+            $"dotnet test executed against the workspace build; returncode={exitCode}",
             basedOn: new List<string> { testProject },
             impact: ok ? "release gate open" : "release gate blocked");
         var notes = $"{counts["passed"]} passed, {counts["failed"]} failed, {counts["errors"]} errors";
@@ -135,5 +125,21 @@ public sealed class TesterAgent : Agent
                 $"test suite failed: {notes}\n{tail[^Math.Min(2000, tail.Length)..]}");
         return Ok(new Dictionary<string, object?> { ["test_report"] = report },
                   notes: notes, artifacts: new List<string> { "test_report" });
+    }
+
+    internal static (int ExitCode, string Stdout, string Stderr) RunProcess(
+        ProcessStartInfo startInfo, TimeSpan timeout)
+    {
+        using var proc = Process.Start(startInfo)
+            ?? throw new InvalidOperationException("could not start dotnet test");
+        // Drain both pipes while the child runs so a full buffer cannot block exit.
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+        var stderrTask = proc.StandardError.ReadToEndAsync();
+        if (!proc.WaitForExit((int)timeout.TotalMilliseconds))
+        {
+            try { proc.Kill(entireProcessTree: true); } catch (Exception) { }
+            throw new TimeoutException($"dotnet test timed out after {timeout.TotalSeconds}s");
+        }
+        return (proc.ExitCode, stdoutTask.GetAwaiter().GetResult(), stderrTask.GetAwaiter().GetResult());
     }
 }

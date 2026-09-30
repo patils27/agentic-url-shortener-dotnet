@@ -295,7 +295,10 @@ public sealed class Engine
         object? Primary()
         {
             task.Attempts++;
-            return agent.Run(_ctx, task);
+            var result = agent.Run(_ctx, task);
+            if (!result.Success)
+                throw new InvalidOperationException($"agent failed: {result.Notes}");
+            return result;
         }
 
         void OnRetry(int attempt, double delay, Exception exc) =>

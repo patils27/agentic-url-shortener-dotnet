@@ -43,7 +43,7 @@ All projects target `net10.0`.
 dotnet test AgenticUrlShortener.sln --nologo -v q
 ```
 
-24/24 passing: 12 service tests + 12 orchestrator tests. Generated
+40/40 passing: 23 service cases + 17 orchestrator/agent cases. Generated
 scenario workspaces under `runs/*/workspace/` are ordinary directories
 (not in the solution), so their own suites are never collected by the
 repo test run. Details in [docs/TESTING.md](docs/TESTING.md).
@@ -65,6 +65,7 @@ dotnet src/Service/bin/Debug/net10.0/AgenticUrlShortener.Service.dll
 | `SHORTENER_BASE_URL` | `http://localhost:8000` | Base URL used in generated `short_url` fields |
 | `SHORTENER_RATE_PER_MINUTE` | `60` | Token-bucket refill rate per IP |
 | `SHORTENER_RATE_BURST` | `10` | Token-bucket burst per IP |
+| `SHORTENER_TRUSTED_PROXIES` | (empty) | Comma-separated proxy IP addresses allowed to supply `X-Forwarded-For` |
 | `ASPNETCORE_URLS` | (SDK default) | Bind address, e.g. `http://127.0.0.1:8000` |
 
 ### API endpoints
@@ -88,6 +89,13 @@ bug fixed in the brownfield run). The catch-all `/{code}` route is
 registered **last** so it never shadows `/health`, `/ready`, or `/api/*`.
 Per-IP token-bucket rate limiting returns `429` + `Retry-After`. All JSON
 is snake_case.
+
+Forwarded IP headers are ignored by default. When using a reverse proxy, set
+`SHORTENER_TRUSTED_PROXIES` to its immediate peer IP address. The service consumes
+one forwarded hop, from the right of the header; the proxy must append or replace
+the client IP. The validated IP is used for both rate limiting and click analytics.
+Aliases `health` and `ready` are reserved, regardless of case. Concurrent creates
+with the same idempotency key return one saved response and create one URL.
 
 ### Demo sequence (verified live)
 
@@ -145,8 +153,8 @@ agentic-url-shortener-dotnet/
 │   │                   # Documenter, Release + Codegen (single source of truth)
 │   └── Scenarios/      # greenfield / brownfield / ambiguous CLI runners
 ├── tests/
-│   ├── Service.Tests/      # 12 service tests (WebApplicationFactory)
-│   └── Orchestrator.Tests/ # 12 orchestrator tests (xUnit)
+│   ├── Service.Tests/      # 23 service cases (HTTP and storage)
+│   └── Orchestrator.Tests/ # 17 orchestrator/agent cases (xUnit)
 ├── docs/               # ARCHITECTURE.md, TESTING.md, FINAL_SUMMARY.md
 └── runs/               # scenario run bundles + BUILD_LOG.md
 ```
