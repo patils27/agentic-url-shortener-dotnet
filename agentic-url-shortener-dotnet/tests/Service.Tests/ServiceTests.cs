@@ -1,5 +1,5 @@
 // Service test suite (12 tests): full HTTP coverage of the URL shortener API
-// via WebApplicationFactory. Mirrors the Python test suite test-for-test.
+// via WebApplicationFactory and xUnit for the ASP.NET Core service.
 
 using System.Net;
 using System.Net.Http.Json;

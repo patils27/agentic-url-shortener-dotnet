@@ -139,8 +139,8 @@ public sealed class PlannerAgent : Agent
     {
         var sentences = Regex.Split(requirement, @"[.;]\s*")
             .Select(s => s.Trim()).Where(s => s.Length > 0).ToList();
-        var tech = new[] { "python", "fastapi", "sqlite", "pytest", "uvicorn",
-                           "dotnet", "c#", "asp.net", "xunit" };
+        var tech = new[] { "c#", "asp.net", "aspnet", "sqlite", "xunit",
+                           "kestrel", "dotnet", ".net" };
         var goals = sentences.Where(s => !tech.Any(k => s.ToLowerInvariant().Contains(k))).ToList();
         var constraints = sentences.Where(s => !goals.Contains(s)).ToList();
         var acceptance = new Dictionary<string, List<string>>

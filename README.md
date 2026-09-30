@@ -1,8 +1,8 @@
 # Agentic Software Engineering System — URL Shortener (.NET 10)
 
 A production-style **URL shortener service** built by a **real agentic SDLC
-orchestration framework**, ported feature-for-feature from the Python
-implementation in `~/workspace/agentic-url-shortener/` to **C# on .NET 10**.
+orchestration framework**, implemented in **C# on .NET 10** with
+**ASP.NET Core**.
 The repo is two things in one:
 
 1. **`src/Service/`** — an ASP.NET Core URL shortener (create, redirect,
@@ -169,6 +169,6 @@ agentic-url-shortener-dotnet/
   part of the solution, so `dotnet test` at the repo root never collects
   them.
 - The in-memory per-IP rate limiter does not survive restarts and is not
-  shared across instances — same as the Python original.
+  shared across instances.
 - Human-approval checkpoints are simulated by `--auto` in unattended
   runs; every auto-approval is recorded in `audit.jsonl` like a real one.

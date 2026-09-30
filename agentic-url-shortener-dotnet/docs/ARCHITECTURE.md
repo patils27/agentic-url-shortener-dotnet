@@ -1,8 +1,8 @@
 # Architecture
 
 This document describes the system's components, the orchestration model
-that drives them, and the key design decisions behind both. It is a
-feature-for-feature port of the Python implementation — see
+that drives them, and the key design decisions behind both. The system uses
+C# on .NET with ASP.NET Core for the service. See
 [README.md](../README.md) for setup and usage, and
 [TESTING.md](TESTING.md) for verification.
 

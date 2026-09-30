@@ -285,7 +285,7 @@ public sealed class OrchestratorTests
             {
                 ["policy_action"] = new PolicyAction
                 {
-                    Kind = "write_file", Target = "/tmp/leak.py",
+                    Kind = "write_file", Target = "/tmp/leak.cs",
                     Payload = "api_key = \"sk-live-1234567890abcdef\"",
                 },
             },

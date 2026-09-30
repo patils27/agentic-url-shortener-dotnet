@@ -6,7 +6,7 @@ design detail and [TESTING.md](TESTING.md) for verification.
 
 ## 1. Plan and rationale
 
-**Plan:** port the Python assessment solution feature-for-feature to C# on
+**Plan:** implement the URL shortener and its orchestration framework in C# on
 .NET 8 — (a) a working URL shortener service, and (b) the agentic SDLC
 framework that builds it — then prove the framework by running it through
 three SDLC scenarios: greenfield build, brownfield evolution, and

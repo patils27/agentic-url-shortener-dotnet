@@ -1,7 +1,7 @@
 # Build Log
 
-Chronological record of the .NET 8 port of the agentic URL shortener
-(original Python implementation: `~/workspace/agentic-url-shortener/`).
+Chronological record of the C#/.NET 8 implementation of the agentic URL
+shortener with ASP.NET Core.
 
 SDK: 8.0.425 at `~/workspace/.dotnet` (do not delete). All projects target
 `net8.0`. Pinned packages: `Microsoft.Data.Sqlite` 8.0.11, xUnit 2.9.2 /
@@ -88,8 +88,8 @@ test SDK 17.11.1, `Microsoft.AspNetCore.Mvc.Testing` 8.0.11.
 ## 2026-09-22 — Parity fix + live verification
 
 - `/ready` now performs a real DB check (`store.ListAll()`) and returns
-  `{"status": "ready"|"degraded", "db": "ok"|"error"}` — parity with the
-  Python original. Same fix applied to the `Codegen.cs` template, and the
+  `{"status": "ready"|"degraded", "db": "ok"|"error"}`. The same fix was
+  applied to the C# `Codegen.cs` template, and the
   generated health/ready test strengthened to assert `db == "ok"`.
 - Re-verified generated v2 suite standalone: 12/12 pass.
 - Live curl verification against the built service (port 18080):

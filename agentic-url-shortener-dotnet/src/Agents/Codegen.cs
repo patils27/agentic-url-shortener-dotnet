@@ -6,8 +6,8 @@
 // are real, compiling C# — the scenario workspaces build them with
 // ``dotnet test`` and the results gate the release.
 //
-// v1 is derived from v2 via _to_v1() with exact-match anchors (mirroring the
-// Python codegen), so the two variants can never drift apart silently.
+// v1 is derived from v2 via ToV1() using exact-match anchors.
+// Both variants share C# templates, and unmatched patches fail explicitly.
 
 using System.Text;
 
@@ -479,7 +479,7 @@ public sealed class RateLimiter
 ";
 
     // =======================================================================
-    // src/Shortener/Program.cs — v2. v1 is derived via _to_v1().
+    // src/Shortener/Program.cs — v2. v1 is derived via ToV1().
     //
     // NOTE: the catch-all ``/{code}`` redirect route is registered LAST so it
     // can never shadow /health, /ready, or /api/* routes.

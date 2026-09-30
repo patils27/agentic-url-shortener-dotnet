@@ -94,7 +94,7 @@ public static class BuiltinGates
 
     public static GateResult CheckTestsPassed(RunContext ctx, Dictionary<string, object?> p)
     {
-        // Mirrors the Python gate: a truthy top-level "passed" with no
+        // The .NET test gate requires a true top-level "passed" with no
         // top-level "failed" count. (The per-count breakdown lives in
         // report["counts"].)
         var report = ctx.Get("test_report") as Dictionary<string, object?>;
