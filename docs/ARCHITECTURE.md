@@ -16,6 +16,8 @@ An ASP.NET Core (minimal API) URL shortener with SQLite persistence via
 | File | Responsibility |
 |---|---|
 | `ShortenerApp.cs` | Route definitions and app factory `ShortenerApp.CreateApp(ServiceOptions?)`; catch-all `/{code}` registered **last** so it never shadows `/health`, `/ready`, or `/api/*` |
+| `UrlService.cs` | Constructor-injected URL operations: validation, code allocation, request matching, ownership, expiry and click recording; returns business outcomes rather than HTTP responses |
+| `IUrlRepository.cs` | Persistence contract used by `UrlService`; retains atomic URL-and-idempotency writes; implemented by `UrlStore` |
 | `Models.cs` | Request/response records (`CreateUrlRequest`, `ShortUrlResponse`, `UrlStats`, `ClickRow`, `UrlRow`) |
 | `UrlStore.cs` | SQLite layer (single connection guarded by a lock; lazy schema migration; tables `urls`, `clicks`, `idempotency_requests`) |
 | `ApiKeyAuthentication.cs` | API-key authentication for `/api/*`; stable owner claims, hashed constant-time key comparison, fail-closed configuration |
@@ -38,6 +40,19 @@ health endpoints. Idempotency uses an atomic transaction and a composite
 `(owner_id, key)` primary key, a validated-request hash, and 24-hour retention.
 Old unscoped replay data is never served. See [API access](API_ACCESS.md) for setup
 and migration behavior.
+
+Endpoint parameters receive `UrlService` directly from DI. The service depends on
+`IUrlRepository`, startup options, and an injected `TimeProvider`; it never resolves
+services from `HttpContext` and has no dependency on SQLite. Both the concrete store
+and repository registration resolve to the same singleton. The lock-protected
+connection and transactional behavior remain unchanged. `TimeProvider` is also
+passed to storage so link expiry and replay retention use the same clock.
+
+These boundaries improve single responsibility and dependency inversion. A storage
+implementation can be replaced without editing business rules. The repository
+contract intentionally keeps URL creation and idempotency together for atomicity;
+it excludes database setup helpers used only by tests. This is a focused service
+refactor, not a claim that every class satisfies every SOLID principle.
 
 ### 1.2 The orchestrator (`src/Orchestrator/`)
 

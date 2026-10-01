@@ -87,6 +87,8 @@ public sealed class ArchitectAgent : Agent
             ["modules"] = new List<string>
             {
                 "src/Shortener/Program.cs (HTTP + routing)",
+                "src/Shortener/UrlService.cs (business operations)",
+                "src/Shortener/IUrlRepository.cs (persistence contract)",
                 "src/Shortener/UrlStore.cs", "src/Shortener/Models.cs",
                 "src/Shortener/ClickAnalytics.cs", "src/Shortener/RateLimiter.cs",
             },
@@ -166,8 +168,8 @@ public sealed class ArchitectAgent : Agent
             new()
             {
                 ["change"] = "custom aliases on creation",
-                ["touches"] = new List<string> { "Models", "Program" },
-                ["reason"] = "new request field + alias reservation logic in the create handler",
+                ["touches"] = new List<string> { "Models", "UrlService" },
+                ["reason"] = "new request field + alias reservation logic in the URL service",
             },
             new()
             {
@@ -178,8 +180,8 @@ public sealed class ArchitectAgent : Agent
             new()
             {
                 ["change"] = "refactor: extract Validators.cs",
-                ["touches"] = new List<string> { "Program", "Validators" },
-                ["reason"] = "move inline URL validation out of Program.cs into a shared, unit-testable module",
+                ["touches"] = new List<string> { "UrlService", "Validators" },
+                ["reason"] = "move inline URL validation out of UrlService.cs into a shared, unit-testable module",
             },
         };
         var importers = graph.Keys.ToDictionary(m => m, _ => new HashSet<string>());
@@ -221,9 +223,9 @@ public sealed class ArchitectAgent : Agent
         ctx.Put("impact_analysis", analysis);
         Decide(ctx, cancellationToken,
             "approved brownfield change set: aliases + 410 fix + validators extraction",
-            "impact analysis shows blast radius limited to Models/Program (+ new Validators module); no storage migration; risks documented",
+            "impact analysis shows changes to Models/UrlService/Program (+ new Validators module); no storage migration; risks documented",
             basedOn: new List<string> { "module dependency graph", "planned changes" },
-            impact: "files rewritten: Models.cs, Program.cs; new: Validators.cs, tests",
+            impact: "files rewritten: Models.cs, UrlService.cs, Program.cs; new: Validators.cs, tests",
             alternatives: new List<string>
                 { "separate alias table (rejected: unnecessary migration)" });
 

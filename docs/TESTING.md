@@ -56,6 +56,12 @@ invalid key headers, reserved API aliases, legacy migration, key rotation, and
 24-hour replay expiry using a controlled clock. Generated suites also check
 authentication, ownership, and request matching; smart suites check health access.
 
+**`UrlServiceTests` (7 cases):** business rules tested without HTTP or SQLite,
+including validation before persistence, normalized replay matching, ownership
+checks before analytics reads, atomic-write conflicts, and exact expiry boundaries
+with an injected clock. Integration checks verify repository substitution through
+DI and that the default repository and concrete store share one instance.
+
 **`OrchestratorTests` (15 tests):** DAG execution order, parallel wave
 overlap (real timing overlap, not just completion), gate blocking, retry
 recovery + metrics accounting, retry-exhaustion → rollback, fallback
@@ -91,7 +97,7 @@ export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 
 # From the repo root
 dotnet test AgenticUrlShortener.sln --nologo -v q
-# -> 105 passed (61 + 44), 0 failed
+# -> 112 passed (68 + 44), 0 failed
 ```
 
 **Environment quirk (important):** VSTest opens a dual-mode local socket

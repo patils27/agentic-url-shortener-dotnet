@@ -217,7 +217,7 @@ using Microsoft.Data.Sqlite;
 
 namespace Shortener;
 
-public sealed class UrlStore : IDisposable
+public sealed class UrlStore : IUrlRepository, IDisposable
 {
     private const string Schema = @""
 CREATE TABLE IF NOT EXISTS urls (
@@ -775,9 +775,150 @@ public sealed class ApiKeyAuthentication
 }
 ";
 
-    private const string ProgramCs = @"using System.Globalization;
+    private const string IUrlRepositoryCs = @"namespace Shortener;
+
+/// <summary>Persistence operations needed by URL use cases, independent of SQLite.</summary>
+public interface IUrlRepository
+{
+    void CheckReady();
+    UrlRow? Get(string code);
+    UrlRow? GetOwned(string code, string ownerId);
+    List<UrlRecordDto> ListOwned(string ownerId);
+    bool DeleteOwned(string code, string ownerId);
+    List<ClickRow> ClicksFor(string code, string ownerId);
+    int ClickCount(string code, string ownerId);
+    void RecordClick(string code, string ts, string? referrer, string? userAgent, string? ip);
+    IdempotencyRecord? GetIdempotency(string ownerId, string key);
+
+    // Keep the URL and replay response in one atomic persistence operation.
+    CreateUrlResult CreateWithIdempotency(string code, string url, string createdAt,
+        string? expiresAt, string ownerId, string? key, string requestHash, string body);
+}
+";
+
+    private const string UrlServiceCs = @"using System.Globalization;
 using System.Security.Cryptography;
 using System.Text.Json;
+
+namespace Shortener;
+
+public enum UrlCreationStatus { Created, Replay, InvalidRequest, InvalidIdempotencyKey, IdempotencyConflict, CodeConflict, AllocationFailed }
+public sealed record UrlCreationResult(UrlCreationStatus Status, ShortUrlResponse? Value = null,
+    string? ReplayJson = null, string? Error = null);
+public enum RedirectStatus { Found, Unknown, Expired }
+public sealed record RedirectResult(RedirectStatus Status, string? Destination = null);
+public sealed record ClickMetadata(string? Referrer, string? UserAgent, string? Ip);
+
+/// <summary>URL business operations. No dependency on HTTP, the DI container, or SQLite.</summary>
+public sealed class UrlService(IUrlRepository repository, ShortenerOptions options, TimeProvider clock)
+{
+    private const string Alphabet = ""abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"";
+    private readonly string _baseUrl = options.BaseUrl.TrimEnd('/');
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+
+    public UrlCreationResult Create(string owner, CreateUrlRequest request, string? idempotencyKey = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(owner);
+        string url;
+        string? alias;
+        try
+        {
+            url = Validators.ValidateUrl(request.Url);
+            alias = string.IsNullOrEmpty(request.CustomAlias) ? null : Validators.ValidateAlias(request.CustomAlias);
+        }
+        catch (ArgumentException error)
+        {
+            return new(UrlCreationStatus.InvalidRequest, Error: error.Message);
+        }
+        if (request.ExpiresInDays is < 1 or > 3650)
+            return new(UrlCreationStatus.InvalidRequest, Error: ""expires_in_days must be between 1 and 3650"");
+        if (idempotencyKey is not null && (idempotencyKey.Length is < 1 or > 128 ||
+            idempotencyKey.Any(c => c < '!' || c > '~')))
+            return new(UrlCreationStatus.InvalidIdempotencyKey, Error: ""Idempotency-Key must be 1–128 printable ASCII characters without spaces"");
+
+        var requestHash = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            url, custom_alias = alias, expires_in_days = request.ExpiresInDays,
+        })));
+        if (idempotencyKey is not null && repository.GetIdempotency(owner, idempotencyKey) is { } saved)
+            return saved.RequestHash == requestHash
+                ? new(UrlCreationStatus.Replay, ReplayJson: saved.Body)
+                : new(UrlCreationStatus.IdempotencyConflict, Error: ""Idempotency-Key was already used with a different request"");
+
+        string code;
+        if (alias is not null) code = alias;
+        else
+        {
+            code = string.Empty;
+            for (var i = 0; i < 10; i++)
+            {
+                var candidate = RandomNumberGenerator.GetString(Alphabet, 7);
+                if (repository.Get(candidate) is null) { code = candidate; break; }
+            }
+            if (code.Length == 0)
+                return new(UrlCreationStatus.AllocationFailed, Error: ""could not allocate a short code"");
+        }
+
+        var now = clock.GetUtcNow().UtcDateTime;
+        var response = new ShortUrlResponse
+        {
+            Code = code, ShortUrl = $""{_baseUrl}/{code}"", Url = url,
+            CreatedAt = now.ToString(""o""),
+            ExpiresAt = request.ExpiresInDays is { } days ? now.AddDays(days).ToString(""o"") : null,
+        };
+        var result = repository.CreateWithIdempotency(code, url, response.CreatedAt, response.ExpiresAt,
+            owner, idempotencyKey, requestHash, JsonSerializer.Serialize(response, JsonOptions));
+        return result.Outcome switch
+        {
+            CreateUrlOutcome.Created => new(UrlCreationStatus.Created, Value: response),
+            CreateUrlOutcome.Replay => new(UrlCreationStatus.Replay, ReplayJson: result.Replay),
+            CreateUrlOutcome.IdempotencyConflict => new(UrlCreationStatus.IdempotencyConflict,
+                Error: ""Idempotency-Key was already used with a different request""),
+            CreateUrlOutcome.CodeConflict => new(UrlCreationStatus.CodeConflict,
+                Error: ""short code already in use; retry with a new code""),
+            _ => throw new InvalidOperationException(""Unknown persistence outcome.""),
+        };
+    }
+
+    public List<UrlRecordDto> List(string owner) => repository.ListOwned(owner);
+
+    public UrlRecordDto? GetOwned(string code, string owner)
+    {
+        var row = repository.GetOwned(code, owner);
+        return row is null ? null : new UrlRecordDto
+        {
+            Code = row.Code, Url = row.Url, CreatedAt = row.CreatedAt,
+            ExpiresAt = row.ExpiresAt, Clicks = repository.ClickCount(code, owner),
+        };
+    }
+
+    public UrlStats? Stats(string code, string owner) => repository.GetOwned(code, owner) is null
+        ? null : ClickAnalytics.BuildStats(code, repository.ClicksFor(code, owner));
+
+    public bool Delete(string code, string owner) => repository.DeleteOwned(code, owner);
+
+    public RedirectResult Redirect(string code, ClickMetadata click)
+    {
+        var row = repository.Get(code);
+        if (row is null) return new(RedirectStatus.Unknown);
+        var now = clock.GetUtcNow();
+        if (row.ExpiresAt is not null &&
+            DateTimeOffset.TryParse(row.ExpiresAt, CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal, out var expires) && expires <= now)
+            return new(RedirectStatus.Expired);
+        repository.RecordClick(code, now.UtcDateTime.ToString(""o""), click.Referrer, click.UserAgent, click.Ip);
+        return new(RedirectStatus.Found, row.Url);
+    }
+
+    public bool IsReady()
+    {
+        try { repository.CheckReady(); return true; }
+        catch (Exception) { return false; }
+    }
+}
+";
+
+    private const string ProgramCs = @"using System.Text.Json;
 using Microsoft.AspNetCore.HttpOverrides;
 using Shortener;
 
@@ -792,8 +933,11 @@ WebApplication CreateApp(ShortenerOptions? options = null)
     var builder = WebApplication.CreateBuilder();
     builder.Services.AddSingleton(options);
     builder.Services.AddSingleton<ApiKeyAuthentication>();
+    builder.Services.AddSingleton(TimeProvider.System);
+    builder.Services.AddSingleton<IUrlRepository>(sp => sp.GetRequiredService<UrlStore>());
+    builder.Services.AddSingleton<UrlService>();
     builder.Services.AddSingleton<UrlStore>(sp =>
-        new UrlStore(sp.GetRequiredService<ShortenerOptions>().DbPath));
+        new UrlStore(sp.GetRequiredService<ShortenerOptions>().DbPath, sp.GetRequiredService<TimeProvider>()));
     builder.Services.AddSingleton<RateLimiter>(sp =>
     {
         var o = sp.GetRequiredService<ShortenerOptions>();
@@ -828,13 +972,14 @@ WebApplication CreateApp(ShortenerOptions? options = null)
     string? Referrer(HttpContext c) =>
         c.Request.Headers.TryGetValue(""Referer"", out var r) ? r.ToString() : null;
 
+    var limiter = app.Services.GetRequiredService<RateLimiter>();
+
     // ---- rate limiting (health/ready bypass) -----------------------------
     app.Use(async (context, next) =>
     {
         var path = context.Request.Path.Value ?? string.Empty;
         if (path != ""/health"" && path != ""/ready"")
         {
-            var limiter = context.RequestServices.GetRequiredService<RateLimiter>();
             var (allowed, retryAfter) = limiter.Allow(ClientIp(context));
             if (!allowed)
             {
@@ -849,170 +994,78 @@ WebApplication CreateApp(ShortenerOptions? options = null)
 
     ApiKeyAuthentication.ProtectManagementApi(app);
 
-    // ---- health -----------------------------------------------------------
+    // HTTP handlers bind requests and map business outcomes to the API contract.
     app.MapGet(""/health"", () => Results.Ok(new { status = ""ok"" }));
-    app.MapGet(""/ready"", (HttpContext context) =>
+    app.MapGet(""/ready"", (UrlService service) =>
     {
-        var store = context.RequestServices.GetRequiredService<UrlStore>();
-        string db;
-        try { store.CheckReady(); db = ""ok""; }
-        catch (Exception) { db = ""error""; }
-        return Results.Json(new { status = db == ""ok"" ? ""ready"" : ""degraded"", db },
-            statusCode: db == ""ok"" ? 200 : 503);
+        var ready = service.IsReady();
+        return Results.Json(new { status = ready ? ""ready"" : ""degraded"", db = ready ? ""ok"" : ""error"" },
+            statusCode: ready ? 200 : 503);
     });
 
-    // ---- create short URL ---------------------------------------------------
-    app.MapPost(""/api/urls"", (HttpContext context, CreateUrlRequest body) =>
+    app.MapPost(""/api/urls"", (HttpContext context, CreateUrlRequest body, UrlService service) =>
     {
-        var store = context.RequestServices.GetRequiredService<UrlStore>();
-        var opts = context.RequestServices.GetRequiredService<ShortenerOptions>();
-        var owner = ApiKeyAuthentication.OwnerOf(context);
-
-        // validation
-        string url;
-        try { url = Validators.ValidateUrl(body.Url); }
-        catch (ArgumentException exc)
+        string? key = null;
+        if (context.Request.Headers.TryGetValue(""Idempotency-Key"", out var values))
         {
-            return Results.Json(new { detail = exc.Message }, statusCode: 422);
-        }
-        if (body.ExpiresInDays is < 1 or > 3650)
-            return Results.Json(new { detail = ""expires_in_days must be between 1 and 3650"" }, statusCode: 422);
-
-        string code;
-        if (!string.IsNullOrEmpty(body.CustomAlias))
-        {
-            try { code = Validators.ValidateAlias(body.CustomAlias); }
-            catch (ArgumentException exc)
-            {
-                return Results.Json(new { detail = exc.Message }, statusCode: 422);
-            }
-        }
-        else
-        {
-            code = string.Empty;
-            for (var i = 0; i < 10; i++)
-            {
-                var candidate = GenerateCode();
-                if (store.Get(candidate) is null) { code = candidate; break; }
-            }
-            if (string.IsNullOrEmpty(code))
-                return Results.Json(new { detail = ""could not allocate a short code"" }, statusCode: 500);
-        }
-
-        string? idempotencyKey = null;
-        if (context.Request.Headers.TryGetValue(""Idempotency-Key"", out var keyValues))
-        {
-            if (keyValues.Count != 1 || string.IsNullOrEmpty(keyValues[0]) || keyValues[0]!.Length > 128 ||
-                keyValues[0]!.Any(c => c < '!' || c > '~'))
+            if (values.Count != 1 || values[0] is null)
                 return Results.Json(new { detail = ""Idempotency-Key must be 1–128 printable ASCII characters without spaces"" }, statusCode: 400);
-            idempotencyKey = keyValues[0];
+            key = values[0];
         }
-        var requestHash = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(new
+        var result = service.Create(ApiKeyAuthentication.OwnerOf(context), body, key);
+        return result.Status switch
         {
-            url, custom_alias = string.IsNullOrEmpty(body.CustomAlias) ? null : body.CustomAlias,
-            expires_in_days = body.ExpiresInDays,
-        })));
-        if (idempotencyKey is not null && store.GetIdempotency(owner, idempotencyKey) is { } saved)
-        {
-            if (saved.RequestHash != requestHash)
-                return Results.Json(new { detail = ""Idempotency-Key was already used with a different request"" }, statusCode: 422);
-            return Results.Json(JsonSerializer.Deserialize<JsonElement>(saved.Body), statusCode: 200);
-        }
-
-        // persistence
-        var now = DateTime.UtcNow;
-        var createdAt = now.ToString(""o"");
-        string? expiresAt = null;
-        if (body.ExpiresInDays is not null)
-            expiresAt = now.AddDays(body.ExpiresInDays.Value).ToString(""o"");
-
-        var payload = new ShortUrlResponse
-        {
-            Code = code,
-            ShortUrl = $""{opts.BaseUrl.TrimEnd('/')}/{code}"",
-            Url = url,
-            CreatedAt = createdAt,
-            ExpiresAt = expiresAt,
+            UrlCreationStatus.Created => Results.Json(result.Value, jsonOptions, statusCode: 201),
+            UrlCreationStatus.Replay => Results.Json(JsonSerializer.Deserialize<JsonElement>(result.ReplayJson!), statusCode: 200),
+            UrlCreationStatus.InvalidIdempotencyKey => Results.Json(new { detail = result.Error }, statusCode: 400),
+            UrlCreationStatus.InvalidRequest or UrlCreationStatus.IdempotencyConflict =>
+                Results.Json(new { detail = result.Error }, statusCode: 422),
+            UrlCreationStatus.CodeConflict => Results.Json(new { detail = result.Error }, statusCode: 409),
+            UrlCreationStatus.AllocationFailed => Results.Json(new { detail = result.Error }, statusCode: 500),
+            _ => throw new InvalidOperationException(""Unknown URL creation outcome.""),
         };
-        var bodyJson = JsonSerializer.Serialize(payload, jsonOptions);
-
-        // The database transaction resolves concurrent requests with the same key.
-        var result = store.CreateWithIdempotency(code, url, createdAt, expiresAt, owner, idempotencyKey, requestHash, bodyJson);
-        if (result.Outcome == CreateUrlOutcome.IdempotencyConflict)
-            return Results.Json(new { detail = ""Idempotency-Key was already used with a different request"" }, statusCode: 422);
-        if (result.Outcome == CreateUrlOutcome.Replay)
-            return Results.Json(JsonSerializer.Deserialize<JsonElement>(result.Replay!), statusCode: 200);
-        if (result.Outcome == CreateUrlOutcome.CodeConflict)
-            return Results.Json(new { detail = ""short code already in use; retry with a new code"" }, statusCode: 409);
-
-        return Results.Json(payload, jsonOptions, statusCode: 201);
     });
 
-    // ---- list / get / delete / stats -----------------------------------------
-    app.MapGet(""/api/urls"", (HttpContext context) =>
+    app.MapGet(""/api/urls"", (HttpContext context, UrlService service) =>
+        Results.Ok(service.List(ApiKeyAuthentication.OwnerOf(context))));
+
+    app.MapGet(""/api/urls/{code}/stats"", (HttpContext context, string code, UrlService service) =>
     {
-        var store = context.RequestServices.GetRequiredService<UrlStore>();
-        return Results.Ok(store.ListOwned(ApiKeyAuthentication.OwnerOf(context)));
+        var stats = service.Stats(code, ApiKeyAuthentication.OwnerOf(context));
+        // Preserve referrer and user-agent dictionary keys verbatim.
+        return stats is null
+            ? Results.Json(new { detail = ""unknown code"" }, statusCode: 404)
+            : Results.Json(stats, jsonOptions);
     });
 
-    app.MapGet(""/api/urls/{code}/stats"", (HttpContext context, string code) =>
+    app.MapGet(""/api/urls/{code}"", (HttpContext context, string code, UrlService service) =>
     {
-        var store = context.RequestServices.GetRequiredService<UrlStore>();
-        var owner = ApiKeyAuthentication.OwnerOf(context);
-        if (store.GetOwned(code, owner) is null)
-            return Results.Json(new { detail = ""unknown code"" }, statusCode: 404);
-        // NOTE: no DictionaryKeyPolicy — referrer / user-agent breakdown keys
-        // are returned verbatim (matches the API contract).
-        return Results.Json(ClickAnalytics.BuildStats(code, store.ClicksFor(code, owner)), jsonOptions);
+        var row = service.GetOwned(code, ApiKeyAuthentication.OwnerOf(context));
+        return row is null ? Results.NotFound(new { detail = ""unknown code"" }) : Results.Ok(row);
     });
 
-    app.MapGet(""/api/urls/{code}"", (HttpContext context, string code) =>
-    {
-        var store = context.RequestServices.GetRequiredService<UrlStore>();
-        var owner = ApiKeyAuthentication.OwnerOf(context);
-        var row = store.GetOwned(code, owner);
-        if (row is null)
-            return Results.Json(new { detail = ""unknown code"" }, statusCode: 404);
-        return Results.Ok(new UrlRecordDto
-        {
-            Code = row.Code, Url = row.Url, CreatedAt = row.CreatedAt,
-            ExpiresAt = row.ExpiresAt, Clicks = store.ClickCount(row.Code, owner),
-        });
-    });
-
-    app.MapDelete(""/api/urls/{code}"", (HttpContext context, string code) =>
-    {
-        var store = context.RequestServices.GetRequiredService<UrlStore>();
-        if (!store.DeleteOwned(code, ApiKeyAuthentication.OwnerOf(context)))
-            return Results.Json(new { detail = ""unknown code"" }, statusCode: 404);
-        return Results.NoContent();
-    });
+    app.MapDelete(""/api/urls/{code}"", (HttpContext context, string code, UrlService service) =>
+        service.Delete(code, ApiKeyAuthentication.OwnerOf(context))
+            ? Results.NoContent() : Results.NotFound(new { detail = ""unknown code"" }));
 
     // -- EXTENSION POINT: smart-link endpoints (ambiguous scenario) --
 
     // ---- redirect (catch-all, registered last) -----------------------------------
-    app.MapGet(""/{code}"", (HttpContext context, string code) =>
+    app.MapGet(""/{code}"", (HttpContext context, string code, UrlService service) =>
     {
-        var store = context.RequestServices.GetRequiredService<UrlStore>();
-        var row = store.Get(code);
-        if (row is null)
-            return Results.Json(new { detail = ""unknown code"" }, statusCode: 404);
-        if (row.ExpiresAt is not null &&
-            DateTimeOffset.TryParse(row.ExpiresAt, CultureInfo.InvariantCulture,
-                DateTimeStyles.AssumeUniversal, out var exp) && exp <= DateTimeOffset.UtcNow)
-            return Results.Json(new { detail = ""link expired"" }, statusCode: 410);
-        store.RecordClick(row.Code, DateTime.UtcNow.ToString(""o""),
-                          Referrer(context),
-                          context.Request.Headers.UserAgent.ToString(),
-                          ClientIp(context));
-        return Results.Redirect(row.Url, preserveMethod: true); // 307 Temporary Redirect
+        var result = service.Redirect(code, new ClickMetadata(Referrer(context),
+            context.Request.Headers.UserAgent.ToString(), ClientIp(context)));
+        return result.Status switch
+        {
+            RedirectStatus.Unknown => Results.Json(new { detail = ""unknown code"" }, statusCode: 404),
+            RedirectStatus.Expired => Results.Json(new { detail = ""link expired"" }, statusCode: 410),
+            RedirectStatus.Found => Results.Redirect(result.Destination!, preserveMethod: true),
+            _ => throw new InvalidOperationException(""Unknown redirect outcome.""),
+        };
     });
 
     return app;
 }
-
-static string GenerateCode(int length = 7) =>
-    RandomNumberGenerator.GetString(""abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"", length);
 
 // Exposed for WebApplicationFactory in tests.
 public partial class Program { }
@@ -1524,107 +1577,46 @@ public sealed class ServiceTests : IDisposable
     // =======================================================================
 
     /// <summary>
-    /// Derive the v1 (greenfield) file set from the v2 file set.
-    /// v1 differences (documented, intentional):
-    ///   * no custom_alias support in models / Program
-    ///   * URL validation inline in Program.cs (Validators.cs does not exist yet)
-    ///   * KNOWN BUG: expired links return 404 instead of 410 (fixed in brownfield)
+    /// v1 omits aliases and the shared validator module. The HTTP adapter retains
+    /// the planted expired-link 404 bug, fixed by the brownfield scenario.
     /// </summary>
     private static List<FileSpec> ToV1(List<FileSpec> files)
     {
         var result = new List<FileSpec>();
         foreach (var spec in files)
         {
-            if (spec.Path == "Shortener/Validators.cs")
-                continue; // does not exist in v1
+            if (spec.Path == "Shortener/Validators.cs") continue;
+            var content = spec.Content;
             if (spec.Path == "Shortener/Models.cs")
-            {
-                var content = spec.Content.Replace(
-                    "    public string? CustomAlias { get; set; }\n", "");
-                content = content.Replace("string.IsNullOrEmpty(body.CustomAlias) ? null : body.CustomAlias", "(string?)null");
-                result.Add(new FileSpec(spec.Path, content));
-            }
+                content = ReplaceOnce(content, "    public string? CustomAlias { get; set; }\n", "");
+            else if (spec.Path == "Shortener/UrlService.cs")
+                content = ReplaceOnce(content,
+                    @"            url = Validators.ValidateUrl(request.Url);
+            alias = string.IsNullOrEmpty(request.CustomAlias) ? null : Validators.ValidateAlias(request.CustomAlias);",
+                    @"            // v1: inline validation; extracted in the brownfield refactor.
+            url = (request.Url ?? """").Trim();
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var parsed) ||
+                (parsed.Scheme != Uri.UriSchemeHttp && parsed.Scheme != Uri.UriSchemeHttps) ||
+                string.IsNullOrEmpty(parsed.Host))
+                throw new ArgumentException(""url must be an absolute http(s) URL"");
+            alias = null;");
             else if (spec.Path == "Shortener/Program.cs")
-            {
-                var content = spec.Content;
-                var patches = new (string Old, string New)[]
-                {
-                    (@"        string url;
-        try { url = Validators.ValidateUrl(body.Url); }
-        catch (ArgumentException exc)
-        {
-            return Results.Json(new { detail = exc.Message }, statusCode: 422);
+                content = ReplaceOnce(content,
+                    @"RedirectStatus.Expired => Results.Json(new { detail = ""link expired"" }, statusCode: 410)",
+                    @"RedirectStatus.Expired => Results.Json(new { detail = ""link expired"" }, statusCode: 404)");
+            result.Add(new(spec.Path, content));
         }
-        if (body.ExpiresInDays is < 1 or > 3650)
-            return Results.Json(new { detail = ""expires_in_days must be between 1 and 3650"" }, statusCode: 422);
-
-        string code;
-        if (!string.IsNullOrEmpty(body.CustomAlias))
-        {
-            try { code = Validators.ValidateAlias(body.CustomAlias); }
-            catch (ArgumentException exc)
-            {
-                return Results.Json(new { detail = exc.Message }, statusCode: 422);
-            }
-        }
-        else
-        {
-            code = string.Empty;
-            for (var i = 0; i < 10; i++)
-            {
-                var candidate = GenerateCode();
-                if (store.Get(candidate) is null) { code = candidate; break; }
-            }
-            if (string.IsNullOrEmpty(code))
-                return Results.Json(new { detail = ""could not allocate a short code"" }, statusCode: 500);
-        }",
-                     @"        // v1: inline validation (extracted to the shared validators
-        // module in the brownfield refactor)
-        var rawUrl = (body.Url ?? """").Trim();
-        if (!Uri.TryCreate(rawUrl, UriKind.Absolute, out var parsedUrl) ||
-            (parsedUrl.Scheme != Uri.UriSchemeHttp && parsedUrl.Scheme != Uri.UriSchemeHttps) ||
-            string.IsNullOrEmpty(parsedUrl.Host))
-            return Results.Json(new { detail = ""url must be an absolute http(s) URL"" }, statusCode: 422);
-        var url = rawUrl;
-        if (body.ExpiresInDays is < 1 or > 3650)
-            return Results.Json(new { detail = ""expires_in_days must be between 1 and 3650"" }, statusCode: 422);
-
-        string code = GenerateCode();
-        var attempts = 0;
-        while (store.Get(code) is not null && attempts < 10)
-        {
-            code = GenerateCode();
-            attempts++;
-        }"),
-                    (@"            return Results.Json(new { detail = ""link expired"" }, statusCode: 410);",
-                     @"            // KNOWN BUG (fixed in brownfield): expired links are
-            // indistinguishable from unknown ones (404 instead of 410).
-            return Results.Json(new { detail = ""link expired"" }, statusCode: 404);"),
-                };
-                foreach (var (oldText, newText) in patches)
-                {
-                    if (CountOccurrences(content, oldText) != 1)
-                        throw new InvalidOperationException(
-                            $"v1 patch anchor not found exactly once in Program.cs: {oldText[..60]}");
-                    content = content.Replace(oldText, newText);
-                }
-                content = content.Replace("string.IsNullOrEmpty(body.CustomAlias) ? null : body.CustomAlias", "(string?)null");
-                result.Add(new FileSpec(spec.Path, content));
-            }
-            else
-            {
-                result.Add(spec);
-            }
-        }
-        foreach (var spec in result)
-            if (spec.Path == "Shortener/Models.cs" && spec.Content.Contains("CustomAlias"))
-                throw new InvalidOperationException("v1 Models.cs still mentions CustomAlias");
-        foreach (var spec in result)
-            if (spec.Path == "Shortener/Program.cs" &&
-                (spec.Content.Contains("Validators.ValidateUrl") ||
-                 spec.Content.Contains("Validators.ValidateAlias")))
-                throw new InvalidOperationException("v1 Program.cs still references Validators");
+        if (result.Any(spec => spec.Path is "Shortener/Models.cs" or "Shortener/UrlService.cs" &&
+            (spec.Content.Contains("CustomAlias") || spec.Content.Contains("Validators."))))
+            throw new InvalidOperationException("v1 still references aliases or shared validators");
         return result;
+    }
+
+    private static string ReplaceOnce(string content, string oldText, string newText)
+    {
+        if (CountOccurrences(content, oldText) != 1)
+            throw new InvalidOperationException($"v1 patch anchor not found exactly once: {oldText}");
+        return content.Replace(oldText, newText);
     }
 
     private static int CountOccurrences(string text, string sub)
@@ -1759,10 +1751,9 @@ public static class SmartLinks
 ";
 
     public const string SmartEndpointsHealth = @"    // -- smart-link endpoints (added by the smart-link feature) --
-    app.MapGet(""/api/urls/{code}/health"", (HttpContext context, string code) =>
+    app.MapGet(""/api/urls/{code}/health"", (HttpContext context, string code, UrlService service) =>
     {
-        var store = context.RequestServices.GetRequiredService<UrlStore>();
-        var row = store.GetOwned(code, ApiKeyAuthentication.OwnerOf(context));
+        var row = service.GetOwned(code, ApiKeyAuthentication.OwnerOf(context));
         if (row is null)
             return Results.Json(new { detail = ""unknown code"" }, statusCode: 404);
         var result = new Dictionary<string, object?> { [""code""] = code };
@@ -1773,10 +1764,9 @@ public static class SmartLinks
 ";
 
     public const string SmartEndpointsFull = @"    // -- smart-link endpoints (added by the smart-link feature) --
-    app.MapGet(""/api/urls/{code}/health"", (HttpContext context, string code) =>
+    app.MapGet(""/api/urls/{code}/health"", (HttpContext context, string code, UrlService service) =>
     {
-        var store = context.RequestServices.GetRequiredService<UrlStore>();
-        var row = store.GetOwned(code, ApiKeyAuthentication.OwnerOf(context));
+        var row = service.GetOwned(code, ApiKeyAuthentication.OwnerOf(context));
         if (row is null)
             return Results.Json(new { detail = ""unknown code"" }, statusCode: 404);
         var result = new Dictionary<string, object?> { [""code""] = code };
@@ -1920,6 +1910,8 @@ public sealed class SmartTests : IDisposable
             new("Shortener/Models.cs", ModelsCs),
             new("Shortener/Validators.cs", ValidatorsCs),
             new("Shortener/UrlStore.cs", UrlStoreCs),
+            new("Shortener/IUrlRepository.cs", IUrlRepositoryCs),
+            new("Shortener/UrlService.cs", UrlServiceCs),
             new("Shortener/ClickAnalytics.cs", ClickAnalyticsCs),
             new("Shortener/RateLimiter.cs", RateLimiterCs),
             new("Shortener/Program.cs", ProgramCs),

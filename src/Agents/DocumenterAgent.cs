@@ -101,7 +101,7 @@ public sealed class DocumenterAgent : Agent
   intentional behavior change for API clients.
 
 ### Refactored
-- Extracted inline URL validation from `Program.cs` into
+- Extracted inline URL validation from `UrlService.cs` into
   `Validators.cs` with dedicated unit tests.
 
 ### Notes

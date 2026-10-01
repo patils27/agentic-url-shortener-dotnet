@@ -7,7 +7,7 @@ using Microsoft.Data.Sqlite;
 
 namespace AgenticUrlShortener.Service;
 
-public sealed class UrlStore : IDisposable
+public sealed class UrlStore : IUrlRepository, IDisposable
 {
     private const string Schema = @"
 CREATE TABLE IF NOT EXISTS urls (
