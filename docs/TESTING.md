@@ -84,6 +84,11 @@ shutdown, preserve fatal policy exceptions, and log only actual fallback calls.
 nested snapshots, atomic queue operations, synchronized replan snapshots and
 policy denials, and serialized/cancel-aware approvals.
 
+**`AuditTests` (13 cases):** typed JSON round-tripping, legacy log reading,
+reserved-field collision rejection, preservation of JSON value types, detached
+mutable payloads, concurrent file/memory ordering, failed append behavior, and
+nonblank envelope identity. See [Audit format](AUDIT_FORMAT.md).
+
 **Generated variant suites** (run inside scenario workspaces by the
 tester agent): v1 = 22 cases, v2 = 25 cases, smart health-only = 29,
 smart full = 32.
@@ -97,7 +102,7 @@ export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 
 # From the repo root
 dotnet test AgenticUrlShortener.sln --nologo -v q
-# -> 112 passed (68 + 44), 0 failed
+# -> 125 passed (68 + 57), 0 failed
 ```
 
 **Environment quirk (important):** VSTest opens a dual-mode local socket

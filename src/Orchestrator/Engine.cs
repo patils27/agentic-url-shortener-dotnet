@@ -112,7 +112,6 @@ public sealed class Engine
         _dag.Validate();
         _audit.RunStarted(_ctx.Scenario, new Dictionary<string, object?>
         {
-            ["run_id"] = _ctx.RunId,
             ["tasks"] = _dag.Tasks.Keys.OrderBy(k => k).ToList(),
         });
         try

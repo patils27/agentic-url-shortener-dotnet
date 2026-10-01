@@ -65,7 +65,7 @@ refactor, not a claim that every class satisfies every SOLID principle.
 | `Approvals.cs` | Human checkpoints (`RequiresApproval`); `--auto` auto-approves **but logs the decision** |
 | `Policies.cs` | 5 guardrail rules (see §2.4), evaluated **before** actions execute — fail-closed |
 | `Retry.cs` | Bounded retries with exponential backoff + jitter, fallback chain, rollback hooks, `fatalExceptions` that skip retrying |
-| `Audit.cs` | Append-only JSONL audit log (tamper-evident) + `manifest.json` per run |
+| `Audit.cs` / `AuditEvent.cs` | Typed, versioned audit events; synchronized JSONL appends and detached snapshots; `manifest.json` per run |
 | `Metrics.cs` | Success rate, retry count/frequency, rollback frequency, MTTR, end-to-end latency → `metrics.json` |
 | `Replan.cs` | Content-hash drift detection, DAG mutation, invalidation of transitive dependents; governance is re-applied on re-run |
 | `IAgent.cs` | Agent contract (`Run(RunContext, TaskNode, CancellationToken)`) |
@@ -186,8 +186,12 @@ distributed saga — see [TESTING.md](TESTING.md) limitations.
 
 ### 2.6 Audit, metrics, decision lineage
 
-- **Audit**: every state transition appends one JSON line to `audit.jsonl`
-  (append-only → tamper-evident, replayable). `manifest.json` summarizes
+- **Audit**: every state transition appends one typed `AuditEvent` as a JSON line
+  to `audit.jsonl`. The versioned envelope includes timestamp, run, event, actor,
+  and task identity; event-specific fields remain at the root for compatibility.
+  Details cannot overwrite envelope fields. See [Audit format](AUDIT_FORMAT.md)
+  and its JSON schema. Append-only writes do not provide tamper detection.
+  `manifest.json` summarizes
   run identity, status, task outcomes, metrics, audit event counts, and
   replan history.
 - **Metrics** (`metrics.json`): task counts, success rate, attempts/retries
@@ -225,5 +229,5 @@ redirects + health monitoring).
 | 7 | **Fatal exceptions** bypass retries | Guardrail denials are verdicts, not transient failures — retrying them is wrong | Retrying everything (rejected: could loop on policy violations) |
 | 8 | Rule-based deterministic **planner** (no LLM calls) | Fully explainable, reproducible runs; every decomposition is auditable | LLM-based planning (rejected for this build: non-determinism, cost, unverifiable reasoning) — see limitations in [TESTING.md](TESTING.md) |
 | 9 | **Dedicated-thread wave fan-out** (`LongRunning` tasks + `SemaphoreSlim`) with `RunContext` as the shared store | Deterministic parallel fan-out/join for blocking agent delegates; the default thread pool starved under subprocess + lock workloads | `Task.Run` on the pool (rejected: starvation serialized parallel waves — caught by test) |
-| 10 | Append-only **JSONL audit** + separate `manifest.json` | Tamper-evident history plus a cheap summary for tooling | Single mutable log file (rejected: rewrites destroy history) |
+| 10 | Versioned **JSONL audit** + separate `manifest.json` | Structured event history plus a summary for tooling; no cryptographic tamper protection | Single mutable log file (rejected: rewrites destroy history) |
 | 11 | `Microsoft.Data.Sqlite` directly, **no EF Core** | Matches the original's stdlib-sqlite minimalism; full control over schema and snake_case-free storage | EF Core (rejected: heavier, unnecessary for this schema) |

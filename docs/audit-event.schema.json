@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "URL Shortener Audit Event v1",
+  "description": "One JSON object per line in audit.jsonl. Event-specific fields remain at the root for compatibility.",
+  "type": "object",
+  "required": ["schema_version", "timestamp", "run_id", "event", "actor", "task_id"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "run_id": { "type": "string", "pattern": "\\S" },
+    "event": { "type": "string", "pattern": "\\S" },
+    "actor": { "type": "string", "pattern": "\\S" },
+    "task_id": { "type": ["string", "null"] }
+  },
+  "additionalProperties": true
+}

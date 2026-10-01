@@ -64,7 +64,7 @@ public sealed class EngineCancellationTests
             Assert.Equal(TaskStatus.Failed, t.Status);
             Assert.Contains("timed out", t.Error);
         });
-        Assert.DoesNotContain(engine.Audit.Events, e => (string)e["event"]! == "task_succeeded");
+        Assert.DoesNotContain(engine.Audit.Events, e => e.Event == "task_succeeded");
         Assert.Equal(2, engine.Metrics.Summary()["tasks_failed"]);
     }
 
@@ -97,7 +97,7 @@ public sealed class EngineCancellationTests
         Assert.Equal(1, attempts);
         Assert.Equal(0, fallbacks);
         Assert.Contains("timed out", dag.Tasks["a"].Error);
-        Assert.DoesNotContain(engine.Audit.Events, e => (string)e["event"]! == "fallback_invoked");
+        Assert.DoesNotContain(engine.Audit.Events, e => e.Event == "fallback_invoked");
     }
 
     [Fact]
@@ -157,7 +157,7 @@ public sealed class EngineCancellationTests
         });
         Assert.Equal("succeeded", engine.Run()["status"]);
         Assert.Equal(expectedEvents, fallbackRuns);
-        Assert.Equal(expectedEvents, engine.Audit.Events.Count(e => (string)e["event"]! == "fallback_invoked"));
+        Assert.Equal(expectedEvents, engine.Audit.Events.Count(e => e.Event == "fallback_invoked"));
     }
 
     [Fact]
@@ -187,7 +187,7 @@ public sealed class EngineCancellationTests
         Assert.Equal(1, cleanups);
         Assert.Equal(TaskStatus.RolledBack, dag.Tasks["a"].Status);
         Assert.True(engine.Metrics.Tasks["a"].FallbackUsed);
-        Assert.Single(engine.Audit.Events, e => (string)e["event"]! == "rollback_completed");
+        Assert.Single(engine.Audit.Events, e => e.Event == "rollback_completed");
     }
 
     [Theory]

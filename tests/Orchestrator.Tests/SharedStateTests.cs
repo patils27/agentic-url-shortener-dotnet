@@ -153,9 +153,9 @@ public sealed class SharedStateTests
         var input = new List<string> { "original" };
         var returned = audit.Log("test", details: new() { ["items"] = input });
         input.Clear();
-        ((List<string>)returned["items"]!).Clear();
-        ((List<string>)audit.Events[0]["items"]!).Clear();
-        Assert.Equal("original", Assert.Single((List<string>)audit.Events[0]["items"]!));
+        returned.Details.Clear();
+        audit.Events[0].Details.Clear();
+        Assert.Equal("original", Assert.Single(audit.Events[0].Details["items"].EnumerateArray()).GetString());
 
         var replan = new ReplanManager(new Dag(), new RunContext("snapshots"));
         var report = replan.RequestReplan("test", changedTaskIds: new() { "source" });

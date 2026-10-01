@@ -113,7 +113,7 @@ public sealed class OrchestratorTests
         });
         Assert.Equal("stopped", engine.Run()["status"]);
         Assert.Equal(1, engine.Metrics.PolicyDenials);
-        Assert.Contains(engine.Audit.Events, e => (string)e["event"]! == "safe_stop");
+        Assert.Contains(engine.Audit.Events, e => e.Event == "safe_stop");
     }
 
     private static (Engine engine, RunContext ctx) MakeEngine(
@@ -142,16 +142,16 @@ public sealed class OrchestratorTests
         return dag;
     }
 
-    private static string? Detail(IReadOnlyList<Dictionary<string, object?>> events,
+    private static string? Detail(IReadOnlyList<AuditEvent> events,
                                   string eventName, string detailKey, bool? passed = null)
     {
         foreach (var e in events)
         {
-            if ((string)e["event"]! != eventName) continue;
-            // Audit entries flatten details into the top-level dict.
+            if (e.Event != eventName) continue;
+            // JSON details remain flattened on disk; consumers use the typed envelope.
             if (passed is not null &&
-                !Equals(e.GetValueOrDefault("passed"), passed)) continue;
-            return e.GetValueOrDefault(detailKey)?.ToString();
+                (!e.Details.TryGetValue("passed", out var value) || value.GetBoolean() != passed)) continue;
+            return e.Details.TryGetValue(detailKey, out var detail) ? detail.ToString() : null;
         }
         return null;
     }
@@ -207,8 +207,8 @@ public sealed class OrchestratorTests
         Assert.Equal(TaskStatus.Skipped, dag.Tasks["t2"].Status);
         Assert.Equal("failed", manifest["status"]);
         Assert.Contains(engine.Audit.Events, e =>
-            (string)e["event"]! == "gate_entry" &&
-            Equals(e.GetValueOrDefault("passed"), false));
+            e.Event == "gate_entry" &&
+            e.Details["passed"].GetBoolean() == false);
     }
 
     [Fact]
@@ -228,7 +228,7 @@ public sealed class OrchestratorTests
         Assert.Equal(2, summary["total_retries"]);
         Assert.NotNull(summary["mttr_s"]);
         Assert.Equal(2, engine.Audit.Events.Count(
-            e => (string)e["event"]! == "task_retried"));
+            e => e.Event == "task_retried"));
     }
 
     [Fact]
@@ -248,7 +248,7 @@ public sealed class OrchestratorTests
         var metrics = (Dictionary<string, object?>)manifest["metrics"]!;
         Assert.Equal(1, metrics["rollbacks"]);
         Assert.Contains(engine.Audit.Events,
-            e => (string)e["event"]! == "rollback_completed");
+            e => e.Event == "rollback_completed");
     }
 
     [Fact]
@@ -298,11 +298,11 @@ public sealed class OrchestratorTests
         Assert.Equal(TaskStatus.Skipped, dag.Tasks["t2"].Status);
         Assert.True(engine.Metrics.PolicyDenials >= 1);
         var denial = engine.Audit.Events.FirstOrDefault(e =>
-            (string)e["event"]! == "policy_evaluated" &&
-            Equals(e.GetValueOrDefault("allowed"), false));
+            e.Event == "policy_evaluated" &&
+            e.Details["allowed"].GetBoolean() == false);
         Assert.NotNull(denial);
-        Assert.Equal("no_secrets_in_code", denial.GetValueOrDefault("rule")?.ToString());
-        Assert.Contains(engine.Audit.Events, e => (string)e["event"]! == "safe_stop");
+        Assert.Equal("no_secrets_in_code", denial.Details["rule"].GetString());
+        Assert.Contains(engine.Audit.Events, e => e.Event == "safe_stop");
     }
 
     [Fact]

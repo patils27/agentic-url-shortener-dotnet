@@ -1,7 +1,7 @@
-// Audit-grade observability: structured JSONL audit log + run manifest.
+// Structured JSONL audit log + run manifest.
 //
 // Every state transition in the orchestrator is appended as one JSON line so the
-// full history of a run is replayable and tamper-evident (append-only).
+// history can be inspected. Append-only writes do not provide tamper detection.
 
 using System.Text.Json;
 
@@ -15,7 +15,11 @@ public sealed class AuditLogger
         WriteIndented = false,
     };
 
-    private readonly List<Dictionary<string, object?>> _events = new();
+    private readonly List<AuditEvent> _events = new();
+    private static readonly HashSet<string> ReservedFields = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "schema_version", "timestamp", "run_id", "event", "actor", "task_id",
+    };
     private readonly object _lock = new();
 
     public string RunId { get; }
@@ -24,6 +28,7 @@ public sealed class AuditLogger
 
     public AuditLogger(string runId, string? runDir = null)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(runId);
         RunId = runId;
         RunDir = runDir;
         if (runDir is not null)
@@ -33,29 +38,33 @@ public sealed class AuditLogger
         }
     }
 
-    public Dictionary<string, object?> Log(string eventName, string actor = "orchestrator",
-                                           string? taskId = null,
-                                           Dictionary<string, object?>? details = null)
+    public AuditEvent Log(string eventName, string actor = "orchestrator",
+                          string? taskId = null, Dictionary<string, object?>? details = null)
     {
-        var entry = new Dictionary<string, object?>
-        {
-            ["timestamp"] = RunContext.NowIso(),
-            ["run_id"] = RunId,
-            ["event"] = eventName,
-            ["actor"] = actor,
-            ["task_id"] = taskId,
-        };
+        ArgumentException.ThrowIfNullOrWhiteSpace(eventName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(actor);
+        var fields = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
         if (details is not null)
-            foreach (var kv in ContextSnapshot.Copy(details)) entry[kv.Key] = kv.Value;
+            foreach (var (key, value) in details)
+            {
+                if (ReservedFields.Contains(key))
+                    throw new ArgumentException($"Audit details cannot replace the reserved field '{key}'.", nameof(details));
+                fields.Add(key, JsonSerializer.SerializeToElement(value, JsonOptions));
+            }
 
-        var line = JsonSerializer.Serialize(entry, JsonOptions);
         lock (_lock)
         {
-            _events.Add(entry);
+            var entry = new AuditEvent
+            {
+                Timestamp = DateTimeOffset.UtcNow, RunId = RunId,
+                Event = eventName, Actor = actor, TaskId = taskId, Details = fields,
+            };
             if (Path is not null)
-                File.AppendAllText(Path, line + "\n");
+                File.AppendAllText(Path, JsonSerializer.Serialize(entry, JsonOptions) + "\n");
+            // Do not report an event as recorded when the file append failed.
+            _events.Add(entry);
+            return entry.Snapshot();
         }
-        return ContextSnapshot.Copy(entry);
     }
 
     private Dictionary<string, object?> D(params (string Key, object? Value)[] pairs) =>
@@ -119,9 +128,9 @@ public sealed class AuditLogger
         Log("decision_recorded", actor: actor,
             details: D(("decision_id", (object?)decisionId), ("summary", summary)));
 
-    public IReadOnlyList<Dictionary<string, object?>> Events
+    public IReadOnlyList<AuditEvent> Events
     {
-        get { lock (_lock) return ContextSnapshot.Copy(_events); }
+        get { lock (_lock) return _events.Select(entry => entry.Snapshot()).ToArray(); }
     }
 
     public Dictionary<string, int> EventCounts()
@@ -131,7 +140,7 @@ public sealed class AuditLogger
         {
             foreach (var e in _events)
             {
-                var key = e["event"] as string ?? "?";
+                var key = e.Event;
                 counts[key] = counts.GetValueOrDefault(key) + 1;
             }
         }

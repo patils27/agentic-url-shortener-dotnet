@@ -42,7 +42,7 @@ All projects target `net10.0`.
 dotnet test AgenticUrlShortener.sln --nologo -v q
 ```
 
-112/112 passing: 68 service cases + 44 orchestrator/agent cases. Generated
+125/125 passing: 68 service cases + 57 orchestrator/agent cases. Generated
 scenario workspaces under `runs/*/workspace/` are ordinary directories
 (not in the solution), so their own suites are never collected by the
 repo test run. Details in [docs/TESTING.md](docs/TESTING.md).
