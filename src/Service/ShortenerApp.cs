@@ -20,6 +20,9 @@ public static class ShortenerApp
         options ??= ServiceOptions.FromEnvironment();
 
         var builder = WebApplication.CreateBuilder();
+        builder.Services.AddProblemDetails();
+        builder.Services.AddExceptionHandler<ApiExceptionHandler>();
+        builder.Services.Configure<Microsoft.AspNetCore.Routing.RouteHandlerOptions>(o => o.ThrowOnBadRequest = true);
         builder.Services.AddSingleton(options);
         builder.Services.AddSingleton<ApiKeyAuthentication>();
         builder.Services.AddSingleton(TimeProvider.System);
@@ -39,6 +42,19 @@ public static class ShortenerApp
         });
 
         var app = builder.Build();
+        app.UseMiddleware<RequestCorrelationMiddleware>();
+        // The handler logs failures once, including correlation IDs, in every environment.
+        app.UseExceptionHandler(new Microsoft.AspNetCore.Builder.ExceptionHandlerOptions
+        {
+            SuppressDiagnosticsCallback = _ => true,
+        });
+        // Binding/routing can return an empty error response without throwing.
+        app.UseStatusCodePages(statusContext => Results.Problem(
+            statusCode: statusContext.HttpContext.Response.StatusCode,
+            extensions: new Dictionary<string, object?>
+            {
+                ["correlation_id"] = statusContext.HttpContext.TraceIdentifier,
+            }).ExecuteAsync(statusContext.HttpContext));
 
         var trustedProxies = app.Services.GetRequiredService<ServiceOptions>().TrustedProxies;
         if (trustedProxies.Length > 0)
@@ -87,10 +103,9 @@ public static class ShortenerApp
         app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
         app.MapGet("/ready", (UrlService service) =>
         {
-            var ready = service.IsReady();
-            return Results.Json(new { status = ready ? "ready" : "degraded", db = ready ? "ok" : "error" },
-                statusCode: ready ? 200 : 503);
-        });
+            service.CheckReady();
+            return Results.Ok(new { status = "ready", db = "ok" });
+        }).WithMetadata(new ReadinessEndpoint());
 
         app.MapPost("/api/urls", (HttpContext context, CreateUrlRequest body, UrlService service) =>
         {

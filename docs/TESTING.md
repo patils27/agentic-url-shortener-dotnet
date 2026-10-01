@@ -62,6 +62,12 @@ checks before analytics reads, atomic-write conflicts, and exact expiry boundari
 with an injected clock. Integration checks verify repository substitution through
 DI and that the default repository and concrete store share one instance.
 
+**`ExceptionHandlingTests` (19 cases):** centralized status mapping, safe JSON
+errors in Development and Production (including HTML Accept headers), malformed
+JSON and unsupported content types, readiness contract preservation, unique
+server-generated correlation IDs, and matching structured exception logs.
+The same cases run against generated services.
+
 **`OrchestratorTests` (15 tests):** DAG execution order, parallel wave
 overlap (real timing overlap, not just completion), gate blocking, retry
 recovery + metrics accounting, retry-exhaustion → rollback, fallback
@@ -90,8 +96,8 @@ mutable payloads, concurrent file/memory ordering, failed append behavior, and
 nonblank envelope identity. See [Audit format](AUDIT_FORMAT.md).
 
 **Generated variant suites** (run inside scenario workspaces by the
-tester agent): v1 = 22 cases, v2 = 25 cases, smart health-only = 29,
-smart full = 32.
+tester agent): v1 = 41 cases, v2 = 44 cases, smart health-only = 48,
+smart full = 51.
 
 ## 3. How to run
 
@@ -102,7 +108,7 @@ export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 
 # From the repo root
 dotnet test AgenticUrlShortener.sln --nologo -v q
-# -> 125 passed (68 + 57), 0 failed
+# -> 144 passed (87 + 57), 0 failed
 ```
 
 **Environment quirk (important):** VSTest opens a dual-mode local socket

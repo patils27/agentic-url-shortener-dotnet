@@ -189,7 +189,8 @@ public sealed class PlannerAgent : Agent
             Spec("impl_api", "implementer", "Implement API layer",
                 new Dictionary<string, object?>(impl)
                     { ["files"] = new List<string> { "Shortener/Program.cs",
-                        "Shortener/ShortenerOptions.cs", "Shortener/ApiKeyAuthentication.cs", "Shortener/UrlService.cs" } },
+                        "Shortener/ShortenerOptions.cs", "Shortener/ApiKeyAuthentication.cs", "Shortener/UrlService.cs",
+                        "Shortener/ApiExceptionHandler.cs", "Shortener/RequestCorrelationMiddleware.cs" } },
                 deps: new() { "architect" }, entryGates: new() { "architecture_decided" }),
             Spec("impl_analytics", "implementer", "Implement analytics + rate limiting",
                 new Dictionary<string, object?>(impl)

@@ -912,10 +912,89 @@ public sealed class UrlService(IUrlRepository repository, ShortenerOptions optio
         return new(RedirectStatus.Found, row.Url);
     }
 
-    public bool IsReady()
+    public void CheckReady() => repository.CheckReady();
+}
+";
+
+    private const string ApiExceptionHandlerCs = @"using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.Data.Sqlite;
+
+namespace Shortener;
+
+/// <summary>Maps request failures to safe responses; exception details stay in server logs.</summary>
+public sealed class ApiExceptionHandler(ILogger<ApiExceptionHandler> logger) : IExceptionHandler
+{
+    public async ValueTask<bool> TryHandleAsync(HttpContext context, Exception exception,
+        CancellationToken cancellationToken)
     {
-        try { repository.CheckReady(); return true; }
-        catch (Exception) { return false; }
+        var readiness = context.Features.Get<IExceptionHandlerFeature>()?.Endpoint?
+            .Metadata.GetMetadata<ReadinessEndpoint>() is not null;
+        var status = readiness ? StatusCodes.Status503ServiceUnavailable : exception switch
+        {
+            BadHttpRequestException { StatusCode: 400 or 413 or 415 } badRequest => badRequest.StatusCode,
+            // Busy, locked, or unable to open the database: the service cannot currently serve requests.
+            SqliteException { SqliteErrorCode: 5 or 6 or 14 } => StatusCodes.Status503ServiceUnavailable,
+            TimeoutException => StatusCodes.Status503ServiceUnavailable,
+            _ => StatusCodes.Status500InternalServerError,
+        };
+        logger.Log(status >= 500 ? LogLevel.Error : LogLevel.Warning, new EventId(1001, ""RequestFailed""),
+            exception, ""Request failed with status {StatusCode}. Correlation ID: {CorrelationId}"",
+            status, context.TraceIdentifier);
+
+        context.Response.StatusCode = status;
+        if (readiness)
+        {
+            // Preserve the readiness probe contract used by deployment checks.
+            await context.Response.WriteAsJsonAsync(new
+            {
+                status = ""degraded"", db = ""error"", correlation_id = context.TraceIdentifier,
+            }, cancellationToken);
+            return true;
+        }
+
+        var (title, detail) = status switch
+        {
+            400 => (""Bad Request"", ""The request body or parameters are invalid.""),
+            413 => (""Content Too Large"", ""The request body exceeds the allowed size.""),
+            415 => (""Unsupported Media Type"", ""The request content type is not supported.""),
+            503 => (""Service Unavailable"", ""The service is temporarily unavailable. Try again later.""),
+            _ => (""Internal Server Error"", ""An unexpected error occurred.""),
+        };
+        await Results.Problem(statusCode: status, title: title, detail: detail,
+            extensions: new Dictionary<string, object?> { [""correlation_id""] = context.TraceIdentifier })
+            .ExecuteAsync(context);
+        return true;
+    }
+}
+
+internal sealed class ReadinessEndpoint;
+";
+
+    private const string RequestCorrelationMiddlewareCs = @"using System.Diagnostics;
+
+namespace Shortener;
+
+/// <summary>Assigns a server-generated ID to each request and its logging scope.</summary>
+public sealed class RequestCorrelationMiddleware(RequestDelegate next, ILogger<RequestCorrelationMiddleware> logger)
+{
+    public const string HeaderName = ""X-Correlation-ID"";
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        // Do not trust caller-supplied IDs as log fields or response headers.
+        var correlationId = Guid.NewGuid().ToString(""N"");
+        context.TraceIdentifier = correlationId;
+        context.Response.OnStarting(() =>
+        {
+            context.Response.Headers[HeaderName] = correlationId;
+            return Task.CompletedTask;
+        });
+        using var scope = logger.BeginScope(new Dictionary<string, object?>
+        {
+            [""CorrelationId""] = correlationId,
+            [""TraceId""] = Activity.Current?.TraceId.ToString(),
+        });
+        await next(context);
     }
 }
 ";
@@ -933,6 +1012,9 @@ WebApplication CreateApp(ShortenerOptions? options = null)
     options ??= ShortenerOptions.FromEnvironment();
 
     var builder = WebApplication.CreateBuilder();
+    builder.Services.AddProblemDetails();
+    builder.Services.AddExceptionHandler<ApiExceptionHandler>();
+    builder.Services.Configure<Microsoft.AspNetCore.Routing.RouteHandlerOptions>(o => o.ThrowOnBadRequest = true);
     builder.Services.AddSingleton(options);
     builder.Services.AddSingleton<ApiKeyAuthentication>();
     builder.Services.AddSingleton(TimeProvider.System);
@@ -952,6 +1034,19 @@ WebApplication CreateApp(ShortenerOptions? options = null)
     });
 
     var app = builder.Build();
+    app.UseMiddleware<RequestCorrelationMiddleware>();
+    // The handler logs failures once, including correlation IDs, in every environment.
+    app.UseExceptionHandler(new Microsoft.AspNetCore.Builder.ExceptionHandlerOptions
+    {
+        SuppressDiagnosticsCallback = _ => true,
+    });
+    // Binding/routing can return an empty error response without throwing.
+    app.UseStatusCodePages(statusContext => Results.Problem(
+        statusCode: statusContext.HttpContext.Response.StatusCode,
+        extensions: new Dictionary<string, object?>
+        {
+            [""correlation_id""] = statusContext.HttpContext.TraceIdentifier,
+        }).ExecuteAsync(statusContext.HttpContext));
 
     var trustedProxies = app.Services.GetRequiredService<ShortenerOptions>().TrustedProxies;
     if (trustedProxies.Length > 0)
@@ -1000,10 +1095,9 @@ WebApplication CreateApp(ShortenerOptions? options = null)
     app.MapGet(""/health"", () => Results.Ok(new { status = ""ok"" }));
     app.MapGet(""/ready"", (UrlService service) =>
     {
-        var ready = service.IsReady();
-        return Results.Json(new { status = ready ? ""ready"" : ""degraded"", db = ready ? ""ok"" : ""error"" },
-            statusCode: ready ? 200 : 503);
-    });
+        service.CheckReady();
+        return Results.Ok(new { status = ""ready"", db = ""ok"" });
+    }).WithMetadata(new ReadinessEndpoint());
 
     app.MapPost(""/api/urls"", (HttpContext context, CreateUrlRequest body, UrlService service) =>
     {
@@ -1107,6 +1201,186 @@ public partial class Program { }
   </ItemGroup>
 
 </Project>
+";
+
+    private const string ExceptionHandlingTestsCs = @"using System.Collections.Concurrent;
+using System.Net;
+using System.Text;
+using System.Text.Json;
+using Shortener;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Xunit;
+
+public sealed class ExceptionHandlingTests
+{
+    private const string PrivateDetail = ""secret-token internal/database.db stack detail"";
+
+    [Theory]
+    [InlineData(""unexpected"", 500)]
+    [InlineData(""argument"", 500)]
+    [InlineData(""access"", 500)]
+    [InlineData(""cancellation"", 500)]
+    [InlineData(""timeout"", 503)]
+    [InlineData(""busy"", 503)]
+    [InlineData(""locked"", 503)]
+    [InlineData(""open"", 503)]
+    [InlineData(""corrupt"", 500)]
+    [InlineData(""large"", 413)]
+    public async Task FailuresAreMappedSanitizedAndLoggedWithMatchingCorrelationId(string failure, int status)
+    {
+        Exception exception = failure switch
+        {
+            ""argument"" => new ArgumentException(PrivateDetail),
+            ""access"" => new UnauthorizedAccessException(PrivateDetail),
+            ""cancellation"" => new OperationCanceledException(PrivateDetail),
+            ""timeout"" => new TimeoutException(PrivateDetail),
+            ""busy"" => new SqliteException(PrivateDetail, 5),
+            ""locked"" => new SqliteException(PrivateDetail, 6),
+            ""open"" => new SqliteException(PrivateDetail, 14),
+            ""corrupt"" => new SqliteException(PrivateDetail, 11),
+            ""large"" => new BadHttpRequestException(PrivateDetail, 413),
+            _ => new InvalidOperationException(PrivateDetail),
+        };
+        var logger = new CapturingLogger();
+        using var factory = new ShortenerTestFactory();
+        using var failing = factory.WithWebHostBuilder(builder =>
+        {
+            builder.UseEnvironment(""Development"");
+            builder.ConfigureServices(services =>
+            {
+                services.AddSingleton<IUrlRepository>(new FailingRepository(exception));
+                services.AddSingleton<ILogger<ApiExceptionHandler>>(logger);
+            });
+        });
+        using var client = failing.CreateClient();
+        client.DefaultRequestHeaders.Accept.ParseAdd(""text/html"");
+        using var response = await client.GetAsync(""/api/urls"");
+        Assert.Equal(status, (int)response.StatusCode);
+        Assert.Equal(""application/problem+json"", response.Content.Headers.ContentType?.MediaType);
+        var content = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain(PrivateDetail, content);
+        Assert.DoesNotContain(exception.GetType().Name, content);
+        Assert.DoesNotContain(""stack"", content, StringComparison.OrdinalIgnoreCase);
+        using var body = JsonDocument.Parse(content);
+        Assert.Equal(status, body.RootElement.GetProperty(""status"").GetInt32());
+        var correlationId = Assert.Single(response.Headers.GetValues(RequestCorrelationMiddleware.HeaderName));
+        Assert.Equal(correlationId, body.RootElement.GetProperty(""correlation_id"").GetString());
+        var log = Assert.Single(logger.Entries);
+        Assert.Same(exception, log.Exception);
+        Assert.Equal(correlationId, log.Fields[""CorrelationId""]);
+        Assert.Equal(status, log.Fields[""StatusCode""]);
+        Assert.Equal(status >= 500 ? LogLevel.Error : LogLevel.Warning, log.Level);
+    }
+
+    [Theory]
+    [InlineData(""Development"", ""application/json"")]
+    [InlineData(""Production"", ""application/json"")]
+    [InlineData(""Development"", ""text/html"")]
+    [InlineData(""Production"", ""text/html"")]
+    public async Task MalformedJsonHasSafe400InEveryEnvironment(string environment, string accept)
+    {
+        using var factory = new ShortenerTestFactory();
+        using var configured = factory.WithWebHostBuilder(builder => builder.UseEnvironment(environment));
+        using var client = configured.CreateClient();
+        client.DefaultRequestHeaders.Accept.ParseAdd(accept);
+        using var content = new StringContent(""{\""url\"":\""secret-token\"",\""expires_in_days\"":\""private\""}"", Encoding.UTF8, ""application/json"");
+        using var response = await client.PostAsync(""/api/urls"", content);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(""application/problem+json"", response.Content.Headers.ContentType?.MediaType);
+        var json = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain(""secret-token"", json);
+        Assert.DoesNotContain(""private"", json);
+        Assert.DoesNotContain(""Exception"", json);
+        using var body = JsonDocument.Parse(json);
+        Assert.Equal(400, body.RootElement.GetProperty(""status"").GetInt32());
+        Assert.Equal(Assert.Single(response.Headers.GetValues(RequestCorrelationMiddleware.HeaderName)),
+            body.RootElement.GetProperty(""correlation_id"").GetString());
+    }
+
+    [Fact]
+    public async Task UnsupportedContentTypeReturnsSafe415()
+    {
+        using var factory = new ShortenerTestFactory();
+        using var client = factory.CreateClient();
+        using var content = new StringContent(PrivateDetail);
+        using var response = await client.PostAsync(""/api/urls"", content);
+        Assert.Equal(HttpStatusCode.UnsupportedMediaType, response.StatusCode);
+        using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal(415, body.RootElement.GetProperty(""status"").GetInt32());
+    }
+
+    [Theory]
+    [InlineData(""/ready"")]
+    [InlineData(""/READY"")]
+    [InlineData(""/ready/"")]
+    public async Task ReadinessFailuresKeepProbeContractAndAreLogged(string path)
+    {
+        var logger = new CapturingLogger();
+        using var factory = new ShortenerTestFactory();
+        using var failing = factory.WithWebHostBuilder(builder => builder.ConfigureServices(services =>
+        {
+            services.AddSingleton<IUrlRepository>(new FailingRepository(new InvalidOperationException(PrivateDetail)));
+            services.AddSingleton<ILogger<ApiExceptionHandler>>(logger);
+        }));
+        using var client = failing.CreateClient();
+        using var response = await client.GetAsync(path);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        var text = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain(PrivateDetail, text);
+        using var body = JsonDocument.Parse(text);
+        Assert.Equal(""degraded"", body.RootElement.GetProperty(""status"").GetString());
+        Assert.Equal(""error"", body.RootElement.GetProperty(""db"").GetString());
+        Assert.Equal(Assert.Single(logger.Entries).Fields[""CorrelationId""],
+            body.RootElement.GetProperty(""correlation_id"").GetString());
+        using var healthy = await client.GetAsync(""/health"");
+        Assert.Equal(HttpStatusCode.OK, healthy.StatusCode);
+    }
+
+    [Fact]
+    public async Task EveryResponseGetsAnIndependentServerGeneratedCorrelationId()
+    {
+        using var factory = new ShortenerTestFactory(authenticate: false);
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add(RequestCorrelationMiddleware.HeaderName, ""untrusted-client-value"");
+        var ids = new HashSet<string>();
+        foreach (var path in new[] { ""/health"", ""/ready"", ""/api/urls"", ""/missing"", ""/unknown/path"" })
+        {
+            using var response = await client.GetAsync(path);
+            var id = Assert.Single(response.Headers.GetValues(RequestCorrelationMiddleware.HeaderName));
+            Assert.True(Guid.TryParseExact(id, ""N"", out _));
+            Assert.True(ids.Add(id));
+        }
+    }
+
+    private sealed class CapturingLogger : ILogger<ApiExceptionHandler>
+    {
+        public ConcurrentQueue<(LogLevel Level, Exception? Exception, Dictionary<string, object?> Fields)> Entries { get; } = new();
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel level) => true;
+        public void Log<TState>(LogLevel level, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Entries.Enqueue((level, exception, ((IEnumerable<KeyValuePair<string, object?>>)state!).ToDictionary()));
+    }
+
+    private sealed class FailingRepository(Exception exception) : IUrlRepository
+    {
+        public void CheckReady() => throw exception;
+        public List<UrlRecordDto> ListOwned(string ownerId) => throw exception;
+        public UrlRow? Get(string code) => throw exception;
+        public UrlRow? GetOwned(string code, string ownerId) => throw exception;
+        public bool DeleteOwned(string code, string ownerId) => throw exception;
+        public List<ClickRow> ClicksFor(string code, string ownerId) => throw exception;
+        public int ClickCount(string code, string ownerId) => throw exception;
+        public void RecordClick(string code, string ts, string? referrer, string? userAgent, string? ip) => throw exception;
+        public IdempotencyRecord? GetIdempotency(string ownerId, string key) => throw exception;
+        public CreateUrlResult CreateWithIdempotency(string code, string url, string createdAt, string? expiresAt,
+            string ownerId, string? key, string requestHash, string body) => throw exception;
+    }
+}
 ";
 
     private const string TestsHeader = @"// Generated service test suite (__VARIANT_LABEL__).
@@ -1664,15 +1938,14 @@ public static class SmartLinks
                 [""status_code""] = (int)resp.StatusCode,
             };
         }
-        catch (Exception exc)
+        catch (Exception exc) when (exc is HttpRequestException or OperationCanceledException)
         {
-            var msg = exc.Message;
             return new Dictionary<string, object?>
             {
                 [""url""] = url,
                 [""reachable""] = false,
                 [""status_code""] = null,
-                [""error""] = msg.Length > 200 ? msg[..200] : msg,
+                [""error""] = ""link health probe failed"",
             };
         }
     }
@@ -1737,15 +2010,14 @@ public static class SmartLinks
                 [""status_code""] = (int)resp.StatusCode,
             };
         }
-        catch (Exception exc)
+        catch (Exception exc) when (exc is HttpRequestException or OperationCanceledException)
         {
-            var msg = exc.Message;
             return new Dictionary<string, object?>
             {
                 [""url""] = url,
                 [""reachable""] = false,
                 [""status_code""] = null,
-                [""error""] = msg.Length > 200 ? msg[..200] : msg,
+                [""error""] = ""link health probe failed"",
             };
         }
     }
@@ -1818,6 +2090,7 @@ public sealed class SmartTests : IDisposable
         var result = SmartLinks.CheckLinkHealth(""http://127.0.0.1:9/nope"", timeoutS: 1.0);
         Assert.False((bool)result[""reachable""]!);
         Assert.Null(result[""status_code""]);
+        Assert.Equal(""link health probe failed"", result[""error""]);
     }
 
     [Fact]
@@ -1916,8 +2189,11 @@ public sealed class SmartTests : IDisposable
             new("Shortener/UrlService.cs", UrlServiceCs),
             new("Shortener/ClickAnalytics.cs", ClickAnalyticsCs),
             new("Shortener/RateLimiter.cs", RateLimiterCs),
+            new("Shortener/ApiExceptionHandler.cs", ApiExceptionHandlerCs),
+            new("Shortener/RequestCorrelationMiddleware.cs", RequestCorrelationMiddlewareCs),
             new("Shortener/Program.cs", ProgramCs),
             new("Shortener.Tests/Shortener.Tests.csproj", TestsCsproj),
+            new("Shortener.Tests/ExceptionHandlingTests.cs", ExceptionHandlingTestsCs),
         };
         if (variant == "v1")
         {

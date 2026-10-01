@@ -112,9 +112,5 @@ public sealed class UrlService(IUrlRepository repository, ServiceOptions options
         return new(RedirectStatus.Found, row.Url);
     }
 
-    public bool IsReady()
-    {
-        try { repository.CheckReady(); return true; }
-        catch (Exception) { return false; }
-    }
+    public void CheckReady() => repository.CheckReady();
 }

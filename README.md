@@ -42,7 +42,7 @@ All projects target `net10.0`.
 dotnet test AgenticUrlShortener.sln --nologo -v q
 ```
 
-125/125 passing: 68 service cases + 57 orchestrator/agent cases. Generated
+144/144 passing: 87 service cases + 57 orchestrator/agent cases. Generated
 scenario workspaces under `runs/*/workspace/` are ordinary directories
 (not in the solution), so their own suites are never collected by the
 repo test run. Details in [docs/TESTING.md](docs/TESTING.md).
@@ -99,6 +99,10 @@ bug fixed in the brownfield run). The catch-all `/{code}` route is
 registered **last** so it never shadows `/health`, `/ready`, or `/api/*`.
 Per-IP token-bucket rate limiting returns `429` + `Retry-After`. All JSON
 is snake_case.
+
+Unhandled request failures use centralized exception handling with safe Problem
+Details responses and correlation IDs. See [Error handling](docs/ERROR_HANDLING.md)
+for status mappings and how to locate the corresponding server log.
 
 Forwarded IP headers are ignored by default. When using a reverse proxy, set
 `SHORTENER_TRUSTED_PROXIES` to its immediate peer IP address. The service consumes
