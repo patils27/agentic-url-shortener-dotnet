@@ -4,8 +4,7 @@
 // violations, rollback plan recorded, approvals granted), evaluates the
 // `release` policy action (which independently re-checks the guardrails), and
 // publishes docs/RELEASE_CHECKLIST.md. The task itself also carries
-// requires_approval=True, so a human signs off before the run is marked
-// shippable.
+// RequiresApproval = true; approval is interactive unless --auto is enabled.
 
 using AgenticUrlShortener.Orchestrator;
 

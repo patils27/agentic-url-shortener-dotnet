@@ -1,6 +1,6 @@
 // Data models for the URL shortener API.
 // JSON is serialized snake_case (short_url, created_at, ...) to preserve the
-// API contract; see ShortenerApp HTTP JSON configuration.
+// API contract; naming is configured at the HTTP boundary.
 
 namespace AgenticUrlShortener.Service;
 

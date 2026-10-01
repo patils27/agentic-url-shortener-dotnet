@@ -4,14 +4,13 @@
 //   - materialize_subset: write a subset of codegen files (greenfield build).
 //   - write_tests: write the generated xunit suite + test csproj.
 //   - apply_v2: brownfield evolution — rewrite changed files to v2 content,
-//     recording unified diffs in the audit trail.
+//     recording changed paths and diff-line counts in the audit trail.
 //   - smart_feature: ambiguous scenario — add SmartLinks.cs, extend
 //     Program.cs at the marked extension point, and write SmartTests.cs.
 //
 // Every file write is policy-checked (write_file action) BEFORE it happens; a
-// denial raises PolicyViolation, which the engine treats as a fatal safe-stop.
-// Rollback hooks (compensation) are registered with the engine so partial work
-// is undone if the task fails after retries.
+// denial raises PolicyViolationException, which the engine treats as a fatal safe-stop.
+// Registered cleanup hooks provide best-effort compensation for their listed files.
 
 using System.Text;
 using AgenticUrlShortener.Orchestrator;

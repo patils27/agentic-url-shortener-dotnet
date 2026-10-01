@@ -3,6 +3,8 @@
 //   SHORTENER_DB          SQLite path (default "shortener.db"; ":memory:" in tests)
 //   SHORTENER_BASE_URL    public base URL used to build short_url (default http://localhost:8000)
 //   SHORTENER_RATE_PER_MINUTE / SHORTENER_RATE_BURST  rate limiter tuning
+//   SHORTENER_TRUSTED_PROXIES  proxy IPs allowed to supply forwarded client IPs
+//   SHORTENER_API_KEYS    JSON mapping stable owner IDs to secret API keys
 
 namespace AgenticUrlShortener.Service;
 

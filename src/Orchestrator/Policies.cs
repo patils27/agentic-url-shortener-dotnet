@@ -2,8 +2,8 @@
 //
 // Policies are evaluated *before* an action executes. A denial raises
 // PolicyViolationException, which the engine treats as a safe-stop: the run
-// halts, the violation is recorded in the context and audit log, and nothing
-// half-applied is left behind.
+// stops scheduling work and records the violation in the context and audit log.
+// The denied action does not execute; earlier side effects require compensation.
 //
 // Policies implemented:
 //   - no_secrets_in_code: file writes are scanned for secret-like patterns.

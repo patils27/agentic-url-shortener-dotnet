@@ -4,7 +4,7 @@
 //   - design: record architecture decisions (ADRs) for the greenfield build
 //     and publish the API spec the implementers and documenter build against.
 //   - brownfield_impact: scan the baseline codebase, build a module
-//     dependency graph (via using-directive analysis), and determine
+//     approximate dependency graph (via using-directive analysis), and estimate
 //     impacted modules for each planned change.
 //   - smart_design: design the smart-link feature from the (possibly
 //     clarified) normalized requirement.
@@ -132,7 +132,8 @@ public sealed class ArchitectAgent : Agent
                                                                   CancellationToken cancellationToken)
     {
         // Parse C# `using X;` / `using static X;` directives into a module
-        // dependency graph keyed by file name (without extension).
+        // dependency graph keyed by file name (without extension). This is a
+        // heuristic; it does not resolve types or references within a namespace.
         var graph = new Dictionary<string, HashSet<string>>();
         if (!Directory.Exists(srcDir)) return graph;
         foreach (var path in Directory.GetFiles(srcDir, "*.cs"))

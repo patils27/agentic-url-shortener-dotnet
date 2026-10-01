@@ -2,8 +2,8 @@
 //
 // Each agent is a small, auditable unit of work: it reads its task params,
 // does real work (files, subprocesses, analysis), records decisions and
-// artifacts in the RunContext, and returns an AgentResult. Failures raise —
-// the engine's bounded-retry / fallback / rollback machinery handles them.
+// artifacts in the RunContext, and returns an AgentResult. Exceptions and
+// unsuccessful results enter the engine's retry, fallback, and rollback flow.
 
 using AgenticUrlShortener.Orchestrator;
 

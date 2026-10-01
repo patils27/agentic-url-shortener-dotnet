@@ -2,9 +2,9 @@
 //
 // Baseline: the v1 greenfield output is materialized into the run workspace.
 // The planner decomposes the change request; the architect performs real
-// impacted-module analysis (using-directive import graph); the implementer
+// approximate impact analysis (using-directive import graph); the implementer
 // evolves v1 -> v2 (custom aliases + 410 bug fix + validators refactor) with
-// unified diffs in the audit trail; regression tests are refreshed in
+// changed paths and diff-line counts in the audit trail; tests are refreshed in
 // parallel; the release gate requires all tests green plus human approval
 // (the 404->410 change is intentionally behavior-breaking).
 //

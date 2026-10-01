@@ -1,7 +1,7 @@
 // Orchestration engine: executes the task DAG with governance.
 //
 // Execution model per wave (synchronization barrier):
-//   1. ready_wave() -> tasks whose dependencies all succeeded
+//   1. select ready tasks whose dependencies all succeeded
 //   2. entry gates -> human approval (if required) -> policy check
 //   3. agent execution wrapped in bounded retries + backoff; fallback agent on
 //      exhaustion; rollback hooks for compensation

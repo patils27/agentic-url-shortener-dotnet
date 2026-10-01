@@ -1,4 +1,4 @@
-// Code generation: single source of truth for the workspace service.
+// Code templates for scenario workspaces; src/Service is maintained separately.
 //
 // The greenfield implementer materializes the ``v1`` file set into its run
 // workspace; the brownfield implementer evolves ``v1`` into ``v2`` (custom
@@ -46,6 +46,8 @@ public static class Codegen
 //   SHORTENER_DB          SQLite path (default ""shortener.db""; "":memory:"" in tests)
 //   SHORTENER_BASE_URL    public base URL used to build short_url (default http://localhost:8000)
 //   SHORTENER_RATE_PER_MINUTE / SHORTENER_RATE_BURST  rate limiter tuning
+//   SHORTENER_TRUSTED_PROXIES  proxy IPs allowed to supply forwarded client IPs
+//   SHORTENER_API_KEYS    JSON mapping stable owner IDs to secret API keys
 
 namespace Shortener;
 
@@ -101,7 +103,7 @@ public sealed class ShortenerOptions
     // =======================================================================
     private const string ModelsCs = @"// Data models for the URL shortener API.
 // JSON is serialized snake_case (short_url, created_at, ...) to preserve the
-// API contract; see ShortenerApp HTTP JSON configuration.
+// API contract; naming is configured at the HTTP boundary.
 
 namespace Shortener;
 
@@ -696,10 +698,10 @@ public sealed class RateLimiter
 ";
 
     // =======================================================================
-    // src/Shortener/Program.cs — v2. v1 is derived via ToV1().
+    // Service support classes and HTTP entry point for the generated variants.
     //
     // NOTE: the catch-all ``/{code}`` redirect route is registered LAST so it
-    // can never shadow /health, /ready, or /api/* routes.
+    // alongside the catch-all /{code} redirect.
     // =======================================================================
     private const string ApiKeyAuthenticationCs = @"using System.Security.Claims;
 using System.Security.Cryptography;
@@ -1640,14 +1642,14 @@ public sealed class ServiceTests : IDisposable
 
     private const string SmartLinksHealthCs = @"// Smart-link features (scope: health monitoring).
 //
-// Pure helpers + thin HTTP wiring in Program.cs. All probes are defensive: a
-// failing probe reports reachable=false instead of throwing.
+// Smart-link helpers and HTTP probes, wired through Program.cs.
+// Probe failures are represented as unreachable results.
 
 namespace Shortener;
 
 public static class SmartLinks
 {
-    /// <summary>Probe the target URL. Never throws.</summary>
+    /// <summary>Probe the target URL and return reachability or failure details.</summary>
     public static Dictionary<string, object?> CheckLinkHealth(string url, double timeoutS = 5.0)
     {
         try
@@ -1679,8 +1681,8 @@ public static class SmartLinks
 
     private const string SmartLinksFullCs = @"// Smart-link features (scope: full — device-aware routing + health).
 //
-// Pure helpers + thin HTTP wiring in Program.cs. All probes are defensive: a
-// failing probe reports reachable=false instead of throwing.
+// Smart-link helpers and HTTP probes, wired through Program.cs.
+// Probe failures are represented as unreachable results.
 
 using System.Text.RegularExpressions;
 
@@ -1720,7 +1722,7 @@ public static class SmartLinks
         return defaultUrl;
     }
 
-    /// <summary>Probe the target URL. Never throws.</summary>
+    /// <summary>Probe the target URL and return reachability or failure details.</summary>
     public static Dictionary<string, object?> CheckLinkHealth(string url, double timeoutS = 5.0)
     {
         try

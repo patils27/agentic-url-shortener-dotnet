@@ -1,8 +1,8 @@
 // Bounded retries with exponential backoff, fallback chain, and rollback hooks.
 //
 // Every task execution is wrapped by Retry.ExecuteWithRetry:
-//   1. Try the primary callable up to max_attempts (bounded — never infinite).
-//   2. Between attempts, sleep backoff_base * 2**(attempt-1) (+ small jitter).
+//   1. Try the primary callable up to maxAttempts.
+//   2. Wait backoffBase * Math.Pow(2, attempt - 1), plus jitter, between attempts.
 //   3. On exhaustion, run the fallback callable if one is registered.
 //   4. Whether the fallback succeeds or not, run rollback hooks to undo any
 //     partial side effects (compensation), recorded in the audit log.
