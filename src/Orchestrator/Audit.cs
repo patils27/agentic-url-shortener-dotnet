@@ -46,7 +46,7 @@ public sealed class AuditLogger
             ["task_id"] = taskId,
         };
         if (details is not null)
-            foreach (var kv in details) entry[kv.Key] = kv.Value;
+            foreach (var kv in ContextSnapshot.Copy(details)) entry[kv.Key] = kv.Value;
 
         var line = JsonSerializer.Serialize(entry, JsonOptions);
         lock (_lock)
@@ -55,7 +55,7 @@ public sealed class AuditLogger
             if (Path is not null)
                 File.AppendAllText(Path, line + "\n");
         }
-        return entry;
+        return ContextSnapshot.Copy(entry);
     }
 
     private Dictionary<string, object?> D(params (string Key, object? Value)[] pairs) =>
@@ -121,7 +121,7 @@ public sealed class AuditLogger
 
     public IReadOnlyList<Dictionary<string, object?>> Events
     {
-        get { lock (_lock) return _events.ToList(); }
+        get { lock (_lock) return ContextSnapshot.Copy(_events); }
     }
 
     public Dictionary<string, int> EventCounts()

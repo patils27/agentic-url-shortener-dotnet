@@ -15,7 +15,7 @@ namespace AgenticUrlShortener.Orchestrator.Tests;
 file sealed class OkAgent(List<string> log) : IAgent
 {
     public string Name => "ok";
-    public AgentResult Run(RunContext ctx, TaskNode task)
+    public AgentResult Run(RunContext ctx, TaskNode task, CancellationToken cancellationToken = default)
     {
         lock (log) log.Add(task.Id);
         return new AgentResult { Success = true, Notes = "ok" };
@@ -27,7 +27,7 @@ file sealed class FlakyAgent(int failTimes, List<(string, int)> log) : IAgent
     public string Name => "flaky";
     private int _calls;
     public int Calls => _calls;
-    public AgentResult Run(RunContext ctx, TaskNode task)
+    public AgentResult Run(RunContext ctx, TaskNode task, CancellationToken cancellationToken = default)
     {
         _calls++;
         log.Add((task.Id, _calls));
@@ -40,7 +40,7 @@ file sealed class FlakyAgent(int failTimes, List<(string, int)> log) : IAgent
 file sealed class SleepAgent(double seconds, List<(string, string, double)> events) : IAgent
 {
     public string Name => "sleep";
-    public AgentResult Run(RunContext ctx, TaskNode task)
+    public AgentResult Run(RunContext ctx, TaskNode task, CancellationToken cancellationToken = default)
     {
         lock (events) events.Add((task.Id, "start", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0));
         Thread.Sleep(TimeSpan.FromSeconds(seconds));
@@ -59,7 +59,7 @@ file sealed class Denier() : ApprovalManager(auto: false)
 file sealed class ResultAgent(Func<AgentResult> run) : IAgent
 {
     public string Name => "result";
-    public AgentResult Run(RunContext ctx, TaskNode task) => run();
+    public AgentResult Run(RunContext ctx, TaskNode task, CancellationToken cancellationToken = default) => run();
 }
 
 public sealed class OrchestratorTests

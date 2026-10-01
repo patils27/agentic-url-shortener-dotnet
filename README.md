@@ -1,6 +1,6 @@
 # Agentic Software Engineering System — URL Shortener (.NET 10)
 
-A production-style **URL shortener service** built by a **real agentic SDLC
+A **URL shortener service** and a **deterministic, template-based SDLC
 orchestration framework**, implemented in **C# on .NET 10** with
 **ASP.NET Core**.
 The repo is two things in one:
@@ -20,9 +20,8 @@ never drift apart. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Prerequisites
 
-- .NET SDK **8.0.425**, installed at `~/workspace/.dotnet`
-  (verify with `~/workspace/.dotnet/dotnet --version`).
-- A Unix-like shell. No external services — SQLite via
+- .NET SDK **10.x** (verify with `dotnet --version`).
+- PowerShell or a Unix-like shell. No external services — SQLite via
   `Microsoft.Data.Sqlite`, no Docker, no network needed at runtime.
 
 ```bash
@@ -43,7 +42,7 @@ All projects target `net10.0`.
 dotnet test AgenticUrlShortener.sln --nologo -v q
 ```
 
-40/40 passing: 23 service cases + 17 orchestrator/agent cases. Generated
+81/81 passing: 37 service cases + 44 orchestrator/agent cases. Generated
 scenario workspaces under `runs/*/workspace/` are ordinary directories
 (not in the solution), so their own suites are never collected by the
 repo test run. Details in [docs/TESTING.md](docs/TESTING.md).
@@ -82,6 +81,8 @@ dotnet src/Service/bin/Debug/net10.0/AgenticUrlShortener.Service.dll
 | `GET` | `/ready` | Readiness — performs a DB check, returns `db: ok\|error` |
 
 POST accepts `{"url": "...", "custom_alias": "...", "expires_in_days": N}`.
+When supplied, `expires_in_days` must be between 1 and 3650 inclusive;
+values outside that range return `422`. Expiry comparisons use UTC instants.
 Generated codes are 7 alphanumeric characters; aliases must be 3–32 chars
 of `[A-Za-z0-9_-]`. Conflicting aliases → `409`; invalid destination →
 `422`; expired links → `410` (v1 incorrectly returned `404` — the planted
@@ -96,6 +97,10 @@ one forwarded hop, from the right of the header; the proxy must append or replac
 the client IP. The validated IP is used for both rate limiting and click analytics.
 Aliases `health` and `ready` are reserved, regardless of case. Concurrent creates
 with the same idempotency key return one saved response and create one URL.
+
+`/ready` performs a bounded database query and returns `503` with
+`{"status":"degraded","db":"error"}` when storage cannot be queried.
+`/health` remains a separate liveness check.
 
 ### Demo sequence (verified live)
 
@@ -153,14 +158,24 @@ agentic-url-shortener-dotnet/
 │   │                   # Documenter, Release + Codegen (single source of truth)
 │   └── Scenarios/      # greenfield / brownfield / ambiguous CLI runners
 ├── tests/
-│   ├── Service.Tests/      # 23 service cases (HTTP and storage)
-│   └── Orchestrator.Tests/ # 17 orchestrator/agent cases (xUnit)
+│   ├── Service.Tests/      # 37 service cases (HTTP and storage)
+│   └── Orchestrator.Tests/ # 44 orchestrator/agent cases (xUnit)
 ├── docs/               # ARCHITECTURE.md, TESTING.md, FINAL_SUMMARY.md
 └── runs/               # scenario run bundles + BUILD_LOG.md
 ```
 
 ## Limitations
 
+- The agents execute C# rules and reviewed code templates; they do not call an LLM.
+- Task deadlines signal cooperative cancellation. Built-in agents check it before
+  writes, and the tester kills and joins its subprocess tree. The engine retains
+  the worker slot until execution exits, then records failure and compensates;
+  late completion cannot turn a timeout into success. Custom agents and blocking
+  approval overrides must honor cancellation; in-process code cannot be forcibly
+  terminated safely. Redirected console input may wait until its reader returns.
+- Shared context reads return snapshots. Use `Put`, `Update`, `AppendToList`, or
+  `Take` to publish changes atomically. Custom mutable objects stored in context
+  must provide their own synchronization.
 - The Tester agent resolves `dotnet` from `DOTNET_BIN`, then
   `~/workspace/.dotnet/dotnet`, then `dotnet` on `PATH`; scenario runs
   require one of those to exist.

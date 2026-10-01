@@ -15,37 +15,37 @@ public sealed class DocumenterAgent : Agent
 {
     public override string Name => "documenter";
 
-    public override AgentResult Run(RunContext ctx, TaskNode task)
+    public override AgentResult Run(RunContext ctx, TaskNode task, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var mode = StrParam(task, "mode", "api_docs");
         return mode switch
         {
-            "changelog" => Changelog(ctx, task),
-            "assumptions" => Assumptions(ctx, task),
-            _ => ApiDocs(ctx, task),
+            "changelog" => Changelog(ctx, task, cancellationToken),
+            "assumptions" => Assumptions(ctx, task, cancellationToken),
+            _ => ApiDocs(ctx, task, cancellationToken),
         };
     }
 
-    private string Write(RunContext ctx, TaskNode task, string rel, string content)
+    private string Write(RunContext ctx, TaskNode task, string rel, string content,
+                         CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var ws = StrParam(task, "workspace_dir");
         var path = Path.Combine(ws, "docs", rel);
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        PoliciesOf(ctx)?.Evaluate(
-            new PolicyAction { Kind = "write_file", Target = path, Payload = content },
-            ctx, AuditOf(ctx));
-        File.WriteAllText(path, content);
-        var docs = ctx.Get<List<string>>("documents") ?? new List<string>();
-        docs.Add(rel);
-        ctx.Put("documents", docs);
+        WriteFile(ctx, path, content, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        ctx.AppendToList("documents", rel);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.AddArtifact($"doc:{rel}", "doc",
                         producedBy: $"documenter:{task.Id}", path: path,
                         content: content);
         return path;
     }
 
-    private AgentResult ApiDocs(RunContext ctx, TaskNode task)
+    private AgentResult ApiDocs(RunContext ctx, TaskNode task, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var spec = ctx.Get<List<Dictionary<string, string>>>("api_spec")
                    ?? new List<Dictionary<string, string>>();
         var lines = new List<string>
@@ -56,6 +56,7 @@ public sealed class DocumenterAgent : Agent
         };
         foreach (var ep in spec)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             lines.Add($"### `{ep["method"]} {ep["path"]}`");
             lines.Add($"{ep["description"]}\n");
         }
@@ -69,17 +70,19 @@ public sealed class DocumenterAgent : Agent
             "`GET /api/urls/{code}/stats` returns total clicks, per-day counts, and referrer / user-agent breakdowns.",
             "",
         });
-        var path = Write(ctx, task, "API.md", string.Join("\n", lines));
-        Decide(ctx, "generated API.md from the architect's api_spec",
+        var path = Write(ctx, task, "API.md", string.Join("\n", lines), cancellationToken);
+        Decide(ctx, cancellationToken, "generated API.md from the architect's api_spec",
                "docs generated from the same spec the implementers built against, so docs and code cannot drift",
                basedOn: new List<string> { "api_spec" });
+        cancellationToken.ThrowIfCancellationRequested();
         return Ok(new Dictionary<string, object?> { ["doc"] = path },
                   notes: "API.md written",
                   artifacts: new List<string> { "doc:API.md" });
     }
 
-    private AgentResult Changelog(RunContext ctx, TaskNode task)
+    private AgentResult Changelog(RunContext ctx, TaskNode task, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var content = @"# Changelog
 
 ## v1.0.0 — Brownfield iteration
@@ -102,23 +105,28 @@ public sealed class DocumenterAgent : Agent
 - All v0.1.0 tests still pass unmodified (except the expired-link test, which
   now asserts `410`).
 ";
-        var path = Write(ctx, task, "CHANGELOG.md", content);
-        Decide(ctx, "generated CHANGELOG.md for v1.0.0",
+        var path = Write(ctx, task, "CHANGELOG.md", content, cancellationToken);
+        Decide(ctx, cancellationToken, "generated CHANGELOG.md for v1.0.0",
                "behavior change (404->410) called out explicitly for reviewers",
                basedOn: new List<string> { "impact_analysis" });
+        cancellationToken.ThrowIfCancellationRequested();
         return Ok(new Dictionary<string, object?> { ["doc"] = path },
                   notes: "CHANGELOG.md written",
                   artifacts: new List<string> { "doc:CHANGELOG.md" });
     }
 
-    private AgentResult Assumptions(RunContext ctx, TaskNode task)
+    private AgentResult Assumptions(RunContext ctx, TaskNode task, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var lines = new List<string>
             { "# Assumption Log — 'make short links smarter'", "" };
         foreach (var a in ctx.Assumptions)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
             lines.Add($"- **{a.Id}** [{a.Status}] ({a.Actor}): {a.Statement}" +
                       (string.IsNullOrEmpty(a.ConfirmedBy) ? ""
                        : $" — confirmed by {a.ConfirmedBy}"));
+        }
         lines.AddRange(new[]
         {
             "", "## Resolution", "",
@@ -126,7 +134,7 @@ public sealed class DocumenterAgent : Agent
             "All assumptions were confirmed; the planner's initial hypothesis (health only) was superseded and the DAG was re-planned.",
             "",
         });
-        var p1 = Write(ctx, task, "ASSUMPTIONS.md", string.Join("\n", lines));
+        var p1 = Write(ctx, task, "ASSUMPTIONS.md", string.Join("\n", lines), cancellationToken);
         var design = ctx.Get<Dictionary<string, object?>>("smart_design") ?? new();
         var endpoints = design.GetValueOrDefault("endpoints") as List<string>
                         ?? new List<string>();
@@ -139,10 +147,11 @@ public sealed class DocumenterAgent : Agent
         smart.AddRange(endpoints.Select(e => $"- `{e}`"));
         smart.AddRange(new[]
             { "", "## Notes", "", design.GetValueOrDefault("notes") as string ?? "", "" });
-        var p2 = Write(ctx, task, "SMART_LINKS.md", string.Join("\n", smart));
-        Decide(ctx, "documented assumptions and smart-link API",
+        var p2 = Write(ctx, task, "SMART_LINKS.md", string.Join("\n", smart), cancellationToken);
+        Decide(ctx, cancellationToken, "documented assumptions and smart-link API",
                "assumption log is the audit trail for the ambiguous requirement",
                basedOn: new List<string> { "assumption log", "smart_design" });
+        cancellationToken.ThrowIfCancellationRequested();
         return Ok(new Dictionary<string, object?> { ["docs"] = new List<string> { p1, p2 } },
                   notes: "ASSUMPTIONS.md + SMART_LINKS.md written");
     }

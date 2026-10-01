@@ -18,20 +18,22 @@ public sealed class ArchitectAgent : Agent
 {
     public override string Name => "architect";
 
-    public override AgentResult Run(RunContext ctx, TaskNode task)
+    public override AgentResult Run(RunContext ctx, TaskNode task, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var mode = StrParam(task, "mode", "design");
         return mode switch
         {
-            "brownfield_impact" => BrownfieldImpact(ctx, task),
-            "smart_design" => SmartDesign(ctx, task),
-            _ => Design(ctx, task),
+            "brownfield_impact" => BrownfieldImpact(ctx, task, cancellationToken),
+            "smart_design" => SmartDesign(ctx, task, cancellationToken),
+            _ => Design(ctx, task, cancellationToken),
         };
     }
 
     // ------------------------------------------------------------------
-    private AgentResult Design(RunContext ctx, TaskNode task)
+    private AgentResult Design(RunContext ctx, TaskNode task, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var ws = StrParam(task, "workspace_dir");
         var decisions = new (string Title, string Rationale, string[] Alts, string Impact)[]
         {
@@ -55,8 +57,11 @@ public sealed class ArchitectAgent : Agent
              new[] { "path prefix like /r/{code}" }, "routing correctness"),
         };
         foreach (var (title, rationale, alts, impact) in decisions)
-            Decide(ctx, title, rationale, basedOn: new List<string> { "normalized requirement" },
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Decide(ctx, cancellationToken, title, rationale, basedOn: new List<string> { "normalized requirement" },
                    impact: impact, alternatives: alts.ToList());
+        }
 
         var apiSpec = new List<Dictionary<string, string>>
         {
@@ -93,12 +98,15 @@ public sealed class ArchitectAgent : Agent
                 "idempotency(key PK, body, created_at)",
             },
         };
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("architecture", architecture);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("api_spec", apiSpec);
         var md = new List<string> { "# Architecture Decisions (greenfield)", "" };
         var i = 1;
         foreach (var (title, rationale, alts, impact) in decisions)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             md.Add($"## ADR-{i:00}: {title}");
             md.Add($"- Rationale: {rationale}");
             md.Add($"- Alternatives: {string.Join(", ", alts)}");
@@ -106,18 +114,20 @@ public sealed class ArchitectAgent : Agent
             i++;
         }
         var docPath = Path.Combine(ws, "docs", "ARCHITECTURE_NOTES.md");
-        Directory.CreateDirectory(Path.GetDirectoryName(docPath)!);
-        File.WriteAllText(docPath, string.Join("\n", md));
+        WriteFile(ctx, docPath, string.Join("\n", md), cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.AddArtifact("architecture_decisions", "doc",
                         producedBy: $"architect:{task.Id}", path: docPath,
                         content: string.Join("\n", md));
+        cancellationToken.ThrowIfCancellationRequested();
         return Ok(new Dictionary<string, object?> { ["architecture"] = architecture },
                   notes: $"recorded {decisions.Length} ADRs",
                   artifacts: new List<string> { "architecture_decisions" });
     }
 
     // ------------------------------------------------------------------
-    private static Dictionary<string, HashSet<string>> ModuleGraph(string srcDir)
+    private static Dictionary<string, HashSet<string>> ModuleGraph(string srcDir,
+                                                                  CancellationToken cancellationToken)
     {
         // Parse C# `using X;` / `using static X;` directives into a module
         // dependency graph keyed by file name (without extension).
@@ -125,14 +135,16 @@ public sealed class ArchitectAgent : Agent
         if (!Directory.Exists(srcDir)) return graph;
         foreach (var path in Directory.GetFiles(srcDir, "*.cs"))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var mod = Path.GetFileNameWithoutExtension(path);
             var deps = new HashSet<string>();
             string text;
-            try { text = File.ReadAllText(path); }
+            try { text = File.ReadAllTextAsync(path, cancellationToken).GetAwaiter().GetResult(); }
             catch (IOException) { text = ""; }
             foreach (Match m in Regex.Matches(text, @"^\s*using\s+(?:static\s+)?([\w\.]+)\s*;",
                                               RegexOptions.Multiline))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var ns = m.Groups[1].Value;
                 var leaf = ns.Split('.').Last();
                 if (leaf != mod) deps.Add(leaf);
@@ -142,11 +154,12 @@ public sealed class ArchitectAgent : Agent
         return graph;
     }
 
-    private AgentResult BrownfieldImpact(RunContext ctx, TaskNode task)
+    private AgentResult BrownfieldImpact(RunContext ctx, TaskNode task, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var ws = StrParam(task, "workspace_dir");
         var src = Path.Combine(ws, "src", "Shortener");
-        var graph = ModuleGraph(src);
+        var graph = ModuleGraph(src, cancellationToken);
 
         var changes = new List<Dictionary<string, object?>>
         {
@@ -173,6 +186,7 @@ public sealed class ArchitectAgent : Agent
         foreach (var (mod, deps) in graph)
             foreach (var d in deps)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (!importers.TryGetValue(d, out var set))
                 {
                     set = new HashSet<string>();
@@ -182,6 +196,7 @@ public sealed class ArchitectAgent : Agent
             }
         foreach (var change in changes)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var impacted = new HashSet<string>((List<string>)change["touches"]!);
             foreach (var mod in (List<string>)change["touches"]!)
                 if (importers.TryGetValue(mod, out var set))
@@ -200,9 +215,11 @@ public sealed class ArchitectAgent : Agent
             ["changes"] = changes,
             ["risks"] = risks,
         };
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("architecture", new Dictionary<string, object?> { ["brownfield_changes"] = changes });
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("impact_analysis", analysis);
-        Decide(ctx,
+        Decide(ctx, cancellationToken,
             "approved brownfield change set: aliases + 410 fix + validators extraction",
             "impact analysis shows blast radius limited to Models/Program (+ new Validators module); no storage migration; risks documented",
             basedOn: new List<string> { "module dependency graph", "planned changes" },
@@ -212,10 +229,14 @@ public sealed class ArchitectAgent : Agent
 
         var md = new List<string> { "# Brownfield Impact Analysis", "", "## Module dependency graph" };
         foreach (var (mod, deps) in graph.OrderBy(kv => kv.Key))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
             md.Add($"- `{mod}` uses: {(deps.Count == 0 ? "—" : string.Join(", ", deps.OrderBy(x => x)))}");
+        }
         md.Add("\n## Changes and impacted modules");
         foreach (var c in changes)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             md.Add($"### {c["change"]}");
             md.Add($"- Directly touches: {string.Join(", ", (List<string>)c["touches"]!)}");
             md.Add($"- Impacted (incl. importers): {string.Join(", ", (List<string>)c["impacted_modules"]!)}");
@@ -224,19 +245,21 @@ public sealed class ArchitectAgent : Agent
         md.Add("\n## Risks");
         md.AddRange(risks.Select(r => $"- {r}"));
         var docPath = Path.Combine(ws, "docs", "IMPACT_ANALYSIS.md");
-        Directory.CreateDirectory(Path.GetDirectoryName(docPath)!);
         var content = string.Join("\n", md) + "\n";
-        File.WriteAllText(docPath, content);
+        WriteFile(ctx, docPath, content, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.AddArtifact("impact_analysis", "doc", producedBy: $"architect:{task.Id}",
                         path: docPath, content: content);
+        cancellationToken.ThrowIfCancellationRequested();
         return Ok(new Dictionary<string, object?> { ["impact_analysis"] = analysis },
                   notes: "impact analysis complete",
                   artifacts: new List<string> { "impact_analysis" });
     }
 
     // ------------------------------------------------------------------
-    private AgentResult SmartDesign(RunContext ctx, TaskNode task)
+    private AgentResult SmartDesign(RunContext ctx, TaskNode task, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var ws = StrParam(task, "workspace_dir");
         var clarified = ctx.Get("clarified_requirement") is not null;
         var scope = clarified ? "full" : "health-only";
@@ -253,9 +276,11 @@ public sealed class ArchitectAgent : Agent
             ["endpoints"] = endpoints,
             ["notes"] = "no schema changes; pure functions unit-tested; health probe never raises (returns reachable=false)",
         };
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("smart_design", design);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("architecture", new Dictionary<string, object?> { ["smart_links"] = design });
-        Decide(ctx,
+        Decide(ctx, cancellationToken,
             $"designed smart-link feature with scope '{scope}'",
             (clarified ? "full scope" : "hypothesis scope") + " derived from the " +
             (clarified ? "stakeholder-confirmed requirement" : "planner hypothesis"),
@@ -267,15 +292,16 @@ public sealed class ArchitectAgent : Agent
                 "JS-based client routing (rejected: server-side keeps API contract)",
             });
         var docPath = Path.Combine(ws, "docs", "SMART_DESIGN.md");
-        Directory.CreateDirectory(Path.GetDirectoryName(docPath)!);
         var content = "# Smart-link Design\n\n" +
                       $"Scope: **{scope}** ({(clarified ? "stakeholder-confirmed" : "planner hypothesis")})\n\n" +
                       "## New endpoints\n" +
                       string.Concat(endpoints.Select(e => $"- `{e}`\n")) +
                       "\n## Notes\n" + design["notes"] + "\n";
-        File.WriteAllText(docPath, content);
+        WriteFile(ctx, docPath, content, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.AddArtifact("smart_design", "doc", producedBy: $"architect:{task.Id}",
                         path: docPath, content: content);
+        cancellationToken.ThrowIfCancellationRequested();
         return Ok(new Dictionary<string, object?> { ["smart_design"] = design },
                   notes: $"smart design recorded (scope={scope})",
                   artifacts: new List<string> { "smart_design" });

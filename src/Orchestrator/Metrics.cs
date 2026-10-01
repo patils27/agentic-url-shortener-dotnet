@@ -24,13 +24,25 @@ public sealed class TaskMetrics
 
 public sealed class MetricsCollector
 {
+    private readonly object _sync = new();
+    private readonly Dictionary<string, TaskMetrics> _tasks = new();
+    private int _replans;
+    private int _policyDenials;
+    private int _approvalsRequested;
     private readonly double _runStartedAt = NowMonotonic();
     private readonly string _runStartedWall = RunContext.NowIso();
 
-    public Dictionary<string, TaskMetrics> Tasks { get; } = new();
-    public int Replans { get; set; }
-    public int PolicyDenials { get; set; }
-    public int ApprovalsRequested { get; set; }
+    public Dictionary<string, TaskMetrics> Tasks
+    {
+        get { lock (_sync) return _tasks.ToDictionary(kv => kv.Key, kv => Copy(kv.Value)); }
+    }
+    public int Replans { get { lock (_sync) return _replans; } }
+    public int PolicyDenials { get { lock (_sync) return _policyDenials; } }
+    public int ApprovalsRequested { get { lock (_sync) return _approvalsRequested; } }
+
+    public void IncrementReplans() { lock (_sync) _replans++; }
+    public void IncrementPolicyDenials() { lock (_sync) _policyDenials++; }
+    public void IncrementApprovalsRequested() { lock (_sync) _approvalsRequested++; }
 
     private static double NowMonotonic() =>
         (double)System.Diagnostics.Stopwatch.GetTimestamp() / System.Diagnostics.Stopwatch.Frequency;
@@ -38,31 +50,42 @@ public sealed class MetricsCollector
     // ---- per-task recording ------------------------------------------------
     public void RegisterTask(string taskId, string agent)
     {
-        Tasks.TryAdd(taskId, new TaskMetrics { TaskId = taskId, Agent = agent });
+        lock (_sync) _tasks.TryAdd(taskId, new TaskMetrics { TaskId = taskId, Agent = agent });
     }
 
     public void RecordTask(string taskId, int attempts, int retries, double durationS,
                            string outcome, bool fallbackUsed = false,
                            bool rollbackRun = false, double? mttrS = null)
     {
-        if (!Tasks.TryGetValue(taskId, out var m))
+        lock (_sync)
         {
-            m = new TaskMetrics { TaskId = taskId, Agent = "?" };
-            Tasks[taskId] = m;
+            if (!_tasks.TryGetValue(taskId, out var m))
+            {
+                m = new TaskMetrics { TaskId = taskId, Agent = "?" };
+                _tasks[taskId] = m;
+            }
+            m.Attempts = attempts;
+            m.Retries = retries;
+            m.DurationS = Math.Round(durationS, 3);
+            m.Outcome = outcome;
+            m.FallbackUsed = fallbackUsed;
+            m.RollbackRun = rollbackRun;
+            m.MttrS = mttrS.HasValue ? Math.Round(mttrS.Value, 3) : null;
         }
-        m.Attempts = attempts;
-        m.Retries = retries;
-        m.DurationS = Math.Round(durationS, 3);
-        m.Outcome = outcome;
-        m.FallbackUsed = fallbackUsed;
-        m.RollbackRun = rollbackRun;
-        m.MttrS = mttrS.HasValue ? Math.Round(mttrS.Value, 3) : null;
     }
 
     // ---- run-level aggregates ----------------------------------------------
     public Dictionary<string, object?> Summary()
     {
-        var tasks = Tasks.Values.ToList();
+        List<TaskMetrics> tasks;
+        int replans, policyDenials, approvalsRequested;
+        lock (_sync)
+        {
+            tasks = _tasks.Values.Select(Copy).ToList();
+            replans = _replans;
+            policyDenials = _policyDenials;
+            approvalsRequested = _approvalsRequested;
+        }
         var executed = tasks.Where(t => t.Outcome is "succeeded" or "failed").ToList();
         var succeeded = executed.Where(t => t.Outcome == "succeeded").ToList();
         var totalRetries = tasks.Sum(t => t.Retries);
@@ -86,20 +109,37 @@ public sealed class MetricsCollector
             ["rollback_frequency"] = executed.Count > 0 ? Math.Round((double)rollbacks / executed.Count, 3) : 0.0,
             ["mttr_s"] = mttrs.Count > 0 ? Math.Round(mttrs.Average(), 3) : null,
             ["mttr_samples"] = mttrs.Count,
-            ["replans"] = Replans,
-            ["policy_denials"] = PolicyDenials,
-            ["approvals_requested"] = ApprovalsRequested,
+            ["replans"] = replans,
+            ["policy_denials"] = policyDenials,
+            ["approvals_requested"] = approvalsRequested,
             ["end_to_end_latency_s"] = Math.Round(e2e, 3),
             ["per_task"] = tasks.ToDictionary(t => t.TaskId, t => (object?)new Dictionary<string, object?>
             {
-                ["task_id"] = t.TaskId, ["agent"] = t.Agent,
-                ["attempts"] = t.Attempts, ["retries"] = t.Retries,
-                ["fallback_used"] = t.FallbackUsed, ["rollback_run"] = t.RollbackRun,
-                ["duration_s"] = t.DurationS, ["outcome"] = t.Outcome,
+                ["task_id"] = t.TaskId,
+                ["agent"] = t.Agent,
+                ["attempts"] = t.Attempts,
+                ["retries"] = t.Retries,
+                ["fallback_used"] = t.FallbackUsed,
+                ["rollback_run"] = t.RollbackRun,
+                ["duration_s"] = t.DurationS,
+                ["outcome"] = t.Outcome,
                 ["mttr_s"] = t.MttrS,
             }),
         };
     }
+
+    private static TaskMetrics Copy(TaskMetrics m) => new()
+    {
+        TaskId = m.TaskId,
+        Agent = m.Agent,
+        Attempts = m.Attempts,
+        Retries = m.Retries,
+        DurationS = m.DurationS,
+        Outcome = m.Outcome,
+        FallbackUsed = m.FallbackUsed,
+        RollbackRun = m.RollbackRun,
+        MttrS = m.MttrS,
+    };
 
     public string Write(string runDir)
     {

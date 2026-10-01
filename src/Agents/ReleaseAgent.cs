@@ -15,8 +15,9 @@ public sealed class ReleaseAgent : Agent
 {
     public override string Name => "release";
 
-    public override AgentResult Run(RunContext ctx, TaskNode task)
+    public override AgentResult Run(RunContext ctx, TaskNode task, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var report = ctx.Get<Dictionary<string, object?>>("test_report")
                      ?? new Dictionary<string, object?>();
         var counts = report.GetValueOrDefault("counts") as Dictionary<string, object?>
@@ -52,6 +53,7 @@ public sealed class ReleaseAgent : Agent
         string policyNote;
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             PoliciesOf(ctx)?.Evaluate(
                 new PolicyAction { Kind = "release", Target = task.Id },
                 ctx, AuditOf(ctx));
@@ -74,17 +76,14 @@ public sealed class ReleaseAgent : Agent
 
         var ws = StrParam(task, "workspace_dir");
         var path = Path.Combine(ws, "docs", "RELEASE_CHECKLIST.md");
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var content = string.Join("\n", lines);
-        PoliciesOf(ctx)?.Evaluate(
-            new PolicyAction { Kind = "write_file", Target = path, Payload = content },
-            ctx, AuditOf(ctx));
-        File.WriteAllText(path, content);
-        documents.Add("RELEASE_CHECKLIST.md");
-        ctx.Put("documents", documents);
+        WriteFile(ctx, path, content, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        ctx.AppendToList("documents", "RELEASE_CHECKLIST.md");
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("release_decision", allGreen ? "GO" : "NO-GO");
 
-        Decide(ctx,
+        Decide(ctx, cancellationToken,
             $"release verdict: {(allGreen ? "GO" : "NO-GO")}",
             "checklist evaluated against context state + independent policy evaluation of the release action",
             basedOn: new List<string>
@@ -93,6 +92,7 @@ public sealed class ReleaseAgent : Agent
         if (!allGreen)
             throw new InvalidOperationException("release checklist not green: " +
                 string.Join("; ", checks.Where(c => !c.Ok).Select(c => c.Name)));
+        cancellationToken.ThrowIfCancellationRequested();
         return Ok(new Dictionary<string, object?>
                   { ["verdict"] = "GO", ["checklist"] = path },
                   notes: "release checklist GO");

@@ -15,7 +15,9 @@
       "launchBrowser": true,
       "applicationUrl": "http://localhost:5038",
       "environmentVariables": {
-        "ASPNETCORE_ENVIRONMENT": "Development"
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "SHORTENER_BASE_URL": "http://localhost:5038",
+        "SHORTENER_DB": ":memory:"
       }
     },
     "https": {

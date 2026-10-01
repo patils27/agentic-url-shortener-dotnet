@@ -37,7 +37,7 @@ are returned verbatim per the API contract.
 | File | Responsibility |
 |---|---|
 | `RunContext.cs` | The shared store for the whole run: key/value state, artifacts with content hashes, decision lineage, assumption log, approvals |
-| `Dag.cs` | `AgentTask`/DAG model, topological **wave** computation, parallel fan-out, join barriers, `Invalidate()` for re-planning |
+| `Dag.cs` | `TaskNode`/DAG model, topological **wave** computation, parallel fan-out, join barriers, `Invalidate()` for re-planning |
 | `Engine.cs` | Wave execution (see §2.2); safe-stop on policy violation or denied approval; re-plan draining |
 | `Gates.cs` | Registry of **named** entry (precondition) and exit (postcondition) predicates evaluated against the `RunContext` |
 | `Approvals.cs` | Human checkpoints (`RequiresApproval`); `--auto` auto-approves **but logs the decision** |
@@ -46,7 +46,7 @@ are returned verbatim per the API contract.
 | `Audit.cs` | Append-only JSONL audit log (tamper-evident) + `manifest.json` per run |
 | `Metrics.cs` | Success rate, retry count/frequency, rollback frequency, MTTR, end-to-end latency → `metrics.json` |
 | `Replan.cs` | Content-hash drift detection, DAG mutation, invalidation of transitive dependents; governance is re-applied on re-run |
-| `IAgent.cs` | Agent contract (`ExecuteAsync(RunContext, AgentTask, CancellationToken)`) |
+| `IAgent.cs` | Agent contract (`Run(RunContext, TaskNode, CancellationToken)`) |
 
 ### 1.3 The agents (`src/Agents/`)
 
@@ -116,6 +116,20 @@ go straight to safe-stop, because a guardrail denial is a deliberate
 verdict, not a transient failure.
 
 ### 2.3 Gates and approvals
+
+Task deadlines propagate a `CancellationToken` through agents, retries and
+subprocess waits. The engine holds its semaphore slot and wave barrier until
+execution exits; a timed-out worker is never detached. Compensation runs after
+shutdown and each registered hook runs at most once per execution. Custom
+in-process agents must cooperate with cancellation. Built-in interactive
+approval prompts observe cancellation; redirected input and custom prompt
+overrides can still wait for their readers to return.
+
+`RunContext` protects mutation with a lock and returns detached snapshots of
+its supported collection data. Use `Update`, `AppendToList` and `Take` for
+compound operations instead of modifying a returned collection. Custom mutable
+objects are responsible for their own synchronization. Metrics, audit snapshots,
+policy violation lists, and replan output snapshots are synchronized as well.
 
 Gates are **named predicates**, not inline conditionals — they are
 registered once (`Gates.cs`) and referenced by name from task specs, so the

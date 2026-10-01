@@ -63,6 +63,17 @@ CREATE TABLE IF NOT EXISTS idempotency (
         get { Ensure(); return _conn!; }
     }
 
+    /// <summary>Check database access without loading stored URL records.</summary>
+    public void CheckReady()
+    {
+        lock (_lock)
+        {
+            using var cmd = Conn.CreateCommand();
+            cmd.CommandText = "SELECT 1 FROM urls LIMIT 1";
+            cmd.ExecuteScalar();
+        }
+    }
+
     // -- urls ------------------------------------------------------------
     /// <summary>Insert a short URL. Returns false on code collision.</summary>
     public bool Create(string code, string url, string createdAt, string? expiresAt = null)

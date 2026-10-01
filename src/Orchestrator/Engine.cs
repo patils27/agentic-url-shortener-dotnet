@@ -36,9 +36,21 @@ public sealed class Engine
     private readonly ReplanManager _replan;
     private readonly int _maxParallel;
     private readonly bool _stopOnPolicyViolation;
-    private readonly Dictionary<string, List<Action>> _rollbackHooks = new();
+    private sealed class RollbackRegistration(Action hook)
+    {
+        private int _invoked;
+        public void Reset() => Volatile.Write(ref _invoked, 0);
+        public void Run()
+        {
+            if (Interlocked.Exchange(ref _invoked, 1) == 0) hook();
+        }
+    }
 
-    private bool _stopRequested;
+    private readonly Dictionary<string, List<RollbackRegistration>> _rollbackHooks = new();
+    private readonly object _rollbackLock = new();
+    private readonly object _stopLock = new();
+
+    private volatile bool _stopRequested;
     private string _stopReason = string.Empty;
 
     public Engine(Dag dag, RunContext ctx, Dictionary<string, IAgent> agents,
@@ -69,12 +81,29 @@ public sealed class Engine
     // ---- rollback hook registry --------------------------------------------
     public void RegisterRollback(string taskId, Action hook)
     {
-        if (!_rollbackHooks.TryGetValue(taskId, out var list))
+        lock (_rollbackLock)
         {
-            list = new List<Action>();
-            _rollbackHooks[taskId] = list;
+            if (!_rollbackHooks.TryGetValue(taskId, out var list))
+            {
+                list = new List<RollbackRegistration>();
+                _rollbackHooks[taskId] = list;
+            }
+            list.Add(new RollbackRegistration(hook));
         }
-        list.Add(hook);
+    }
+
+    private List<Action> RollbackHooks(string taskId)
+    {
+        lock (_rollbackLock)
+            return _rollbackHooks.TryGetValue(taskId, out var hooks)
+                ? hooks.Select<RollbackRegistration, Action>(hook => hook.Run).ToList() : new();
+    }
+
+    private void ResetRollbackHooks(string taskId)
+    {
+        lock (_rollbackLock)
+            if (_rollbackHooks.TryGetValue(taskId, out var hooks))
+                foreach (var hook in hooks) hook.Reset();
     }
 
     // ---- main loop ------------------------------------------------------------
@@ -115,6 +144,7 @@ public sealed class Engine
         catch (Exception exc) // never lose the audit trail
         {
             _stopReason = $"engine error: {exc}";
+            _stopRequested = true;
             _audit.Log("engine_error", details: new Dictionary<string, object?> { ["error"] = exc.ToString() });
         }
 
@@ -149,23 +179,38 @@ public sealed class Engine
     }
 
     // ---- wave execution (parallel fan-out + join barrier) ----------------------
-    private void TimeoutTask(TaskNode task)
+    private sealed class ExecutionState
     {
-        lock (task)
+        public bool FallbackUsed { get; set; }
+        public bool RollbackAudited { get; set; }
+    }
+
+    private void TimeoutTask(TaskNode task, double startedAt, ExecutionState execution)
+    {
+        // The agent has exited before compensation runs; it cannot race cleanup.
+        var hooks = RollbackHooks(task.Id);
+        foreach (var hook in hooks)
         {
-            task.Status = TaskStatus.Failed;
-            task.Error = $"task timed out after {task.TimeoutS}s";
+            try { hook(); }
+            catch (Exception exc)
+            {
+                _audit.Rollback(task.Id, "failed", exc.Message);
+            }
         }
+        if (hooks.Count > 0 && !execution.RollbackAudited)
+            _audit.Rollback(task.Id, "completed", "timeout compensation hooks ran");
+        FinishTask(task, false, startedAt, $"task timed out after {task.TimeoutS}s", report: new RetryReport
+        {
+            Succeeded = false, Attempts = task.Attempts, Retries = Math.Max(0, task.Attempts - 1),
+            FallbackUsed = execution.FallbackUsed, FallbackSucceeded = false, RollbackRun = hooks.Count > 0,
+            TotalDurationS = NowMonotonic() - startedAt,
+        });
         _audit.TaskFailed(task.Id, task.Error, task.Attempts);
     }
 
-    private void WrapperError(TaskNode task, Exception exc)
+    private void WrapperError(TaskNode task, Exception exc, double startedAt)
     {
-        lock (task)
-        {
-            task.Status = TaskStatus.Failed;
-            task.Error = $"engine wrapper error: {exc.Message}";
-        }
+        FinishTask(task, false, startedAt, $"engine wrapper error: {exc.Message}");
         _audit.TaskFailed(task.Id, task.Error, task.Attempts);
     }
 
@@ -186,32 +231,39 @@ public sealed class Engine
         var running = wave.Select(task => Task.Factory.StartNew(() =>
         {
             semaphore.Wait();
+            var startedAt = NowMonotonic();
+            var execution = new ExecutionState();
             try
             {
-                using var cts = new CancellationTokenSource(
-                    TimeSpan.FromSeconds(task.TimeoutS + 5));
-                // ExecuteTask is synchronous; run it on a worker and bound the wait.
-                var exec = Task.Factory.StartNew(
-                    () => ExecuteTask(task), cts.Token,
-                    TaskCreationOptions.LongRunning, TaskScheduler.Default);
+                if (_stopRequested)
+                {
+                    task.Status = TaskStatus.Skipped;
+                    task.Error = "run stopped before task started";
+                    _audit.TaskSkipped(task.Id, task.Error);
+                    _metrics.RecordTask(task.Id, 0, 0, 0, "skipped");
+                    return;
+                }
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(task.TimeoutS));
                 try
                 {
-                    exec.Wait(cts.Token);
+                    // Keep the slot and join barrier until the agent actually exits.
+                    // In-process agents must cooperate; cancellation never detaches work.
+                    ExecuteTask(task, cts.Token, execution);
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException) when (cts.IsCancellationRequested)
                 {
-                    TimeoutTask(task);
+                    TimeoutTask(task, startedAt, execution);
                 }
                 catch (Exception exc) // defensive
                 {
-                    WrapperError(task, exc);
+                    WrapperError(task, exc, startedAt);
                 }
             }
             finally
             {
                 semaphore.Release();
             }
-        }, TaskCreationOptions.LongRunning)).ToArray();
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
         Task.WaitAll(running);
 
         // join barrier reached: detect output drift before the next wave
@@ -232,15 +284,18 @@ public sealed class Engine
     }
 
     // ---- single task execution --------------------------------------------------
-    private void ExecuteTask(TaskNode task)
+    private void ExecuteTask(TaskNode task, CancellationToken cancellationToken, ExecutionState execution)
     {
         var t0 = NowMonotonic();
+        ResetRollbackHooks(task.Id);
         task.Status = TaskStatus.Running;
         _audit.TaskStarted(task.Id, task.Agent);
+        cancellationToken.ThrowIfCancellationRequested();
 
         // 1. entry gates (preconditions)
         foreach (var res in _gates.Evaluate(task.EntryGates, "entry", _ctx, task.Params))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             _audit.Gate(task.Id, res.Gate, "entry", res.Passed, res.Reason);
             if (!res.Passed)
             {
@@ -252,7 +307,7 @@ public sealed class Engine
         // 2. human approval checkpoint for high-impact actions
         if (task.RequiresApproval)
         {
-            _metrics.ApprovalsRequested++;
+            _metrics.IncrementApprovalsRequested();
             _audit.Log("approval_requested", taskId: task.Id,
                        details: new Dictionary<string, object?> { ["summary"] = task.ApprovalSummary });
             try
@@ -260,7 +315,7 @@ public sealed class Engine
                 _approvals.Request(_ctx, task.Id,
                     string.IsNullOrEmpty(task.ApprovalSummary) ? task.Name : task.ApprovalSummary,
                     string.IsNullOrEmpty(task.ApprovalImpact) ? "unspecified" : task.ApprovalImpact,
-                    requestedBy: task.Agent, audit: _audit);
+                    requestedBy: task.Agent, audit: _audit, cancellationToken: cancellationToken);
             }
             catch (ApprovalDeniedException exc)
             {
@@ -270,6 +325,7 @@ public sealed class Engine
         }
 
         // 3. policy guardrail: authorize the execution itself
+        cancellationToken.ThrowIfCancellationRequested();
         try
         {
             var action = task.Params.GetValueOrDefault("policy_action") as PolicyAction
@@ -278,7 +334,7 @@ public sealed class Engine
         }
         catch (PolicyViolationException exc)
         {
-            _metrics.PolicyDenials++;
+            _metrics.IncrementPolicyDenials();
             _ctx.RecordDecision("policy-engine", $"deny execution of {task.Id}",
                                 exc.Message, impact: "run safe-stop");
             FinishTask(task, false, t0, exc.Message, fatal: _stopOnPolicyViolation);
@@ -294,8 +350,10 @@ public sealed class Engine
 
         object? Primary()
         {
+            cancellationToken.ThrowIfCancellationRequested();
             task.Attempts++;
-            var result = agent.Run(_ctx, task);
+            var result = agent.Run(_ctx, task, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
             if (!result.Success)
                 throw new InvalidOperationException($"agent failed: {result.Notes}");
             return result;
@@ -311,10 +369,13 @@ public sealed class Engine
         var fallbackNote = string.Empty;
         if (task.FallbackAgent is not null && _agents.TryGetValue(task.FallbackAgent, out var fallbackAgent))
         {
-            _audit.FallbackInvoked(task.Id, task.FallbackAgent);
             fallback = () =>
             {
-                var res = fallbackAgent.Run(_ctx, task);
+                cancellationToken.ThrowIfCancellationRequested();
+                _audit.FallbackInvoked(task.Id, task.FallbackAgent);
+                execution.FallbackUsed = true;
+                var res = fallbackAgent.Run(_ctx, task, cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
                 if (!res.Success)
                     throw new InvalidOperationException($"fallback agent failed: {res.Notes}");
                 fallbackNote = $" (fallback {task.FallbackAgent} used)";
@@ -330,20 +391,24 @@ public sealed class Engine
                 maxAttempts: task.MaxRetries,
                 backoffBase: task.BackoffBase,
                 fallback: fallback,
-                rollbackHooks: _rollbackHooks.GetValueOrDefault(task.Id),
+                rollbackHooks: DeferredRollbackHooks(task.Id),
                 onRetry: OnRetry,
                 onFailure: OnFailure,
-                sleepFn: s => Thread.Sleep(TimeSpan.FromSeconds(s)),
-                typeof(PolicyViolationException));
+                cancellationToken: cancellationToken,
+                fatalExceptions: new[] { typeof(PolicyViolationException) });
         }
         catch (PolicyViolationException exc)
         {
             // In-agent guardrail denial: fail closed, safe-stop the run.
-            _metrics.PolicyDenials++;
+            _metrics.IncrementPolicyDenials();
             _ctx.RecordDecision("policy-engine", $"deny file/action write inside {task.Id}",
                                 exc.Message, impact: "run safe-stop");
             FinishTask(task, false, t0, exc.Message, fatal: true);
             return;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception exc) // defensive
         {
@@ -352,8 +417,11 @@ public sealed class Engine
         }
 
         if (report.RollbackRun)
+        {
             _audit.Rollback(task.Id, "completed",
                             string.IsNullOrEmpty(task.RollbackNote) ? "compensation hooks ran" : task.RollbackNote);
+            execution.RollbackAudited = true;
+        }
         if (!report.Succeeded)
         {
             FinishTask(task, false, t0,
@@ -365,6 +433,7 @@ public sealed class Engine
         // 5. exit gates (postconditions)
         foreach (var res in _gates.Evaluate(task.ExitGates, "exit", _ctx, task.Params))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             _audit.Gate(task.Id, res.Gate, "exit", res.Passed, res.Reason);
             if (!res.Passed)
             {
@@ -375,47 +444,64 @@ public sealed class Engine
         }
 
         // 6. snapshot outputs for drift detection
+        cancellationToken.ThrowIfCancellationRequested();
         _replan.SnapshotOutputs(task.Id);
         var notes = (report.Result as AgentResult)?.Notes ?? string.Empty;
-        FinishTask(task, true, t0, notes + fallbackNote, report: report);
+        FinishTask(task, true, t0, notes + fallbackNote, report: report, cancellationToken: cancellationToken);
+    }
+
+    // Resolve after execution: agents may register compensation during an attempt.
+    private IEnumerable<Action> DeferredRollbackHooks(string taskId)
+    {
+        foreach (var hook in RollbackHooks(taskId)) yield return hook;
     }
 
     private void FinishTask(TaskNode task, bool ok, double t0, string note,
-                            bool fatal = false, RetryReport? report = null)
+                            bool fatal = false, RetryReport? report = null,
+                            CancellationToken cancellationToken = default)
     {
-        var duration = NowMonotonic() - t0;
-        if (ok)
+        lock (task)
         {
-            task.Status = TaskStatus.Succeeded;
-            task.Error = string.Empty;
-            _audit.TaskSucceeded(task.Id, duration, note.Length > 500 ? note[..500] : note);
-        }
-        else
-        {
-            task.Status = TaskStatus.Failed;
-            task.Error = note.Length > 1000 ? note[..1000] : note;
-            if (fatal)
+            if (task.Status != TaskStatus.Running && task.Status != TaskStatus.Pending)
+                return;
+            cancellationToken.ThrowIfCancellationRequested();
+            var duration = NowMonotonic() - t0;
+            if (ok)
             {
-                _stopReason = note;
-                _stopRequested = true;
-                _audit.Log("safe_stop", taskId: task.Id,
-                           details: new Dictionary<string, object?>
-                           {
-                               ["reason"] = note.Length > 500 ? note[..500] : note,
-                           });
+                task.Status = TaskStatus.Succeeded;
+                task.Error = string.Empty;
+                _audit.TaskSucceeded(task.Id, duration, note.Length > 500 ? note[..500] : note);
             }
-            if (report is not null && report.RollbackRun)
-                task.Status = TaskStatus.RolledBack;
+            else
+            {
+                task.Status = TaskStatus.Failed;
+                task.Error = note.Length > 1000 ? note[..1000] : note;
+                if (fatal)
+                {
+                    lock (_stopLock)
+                    {
+                        if (!_stopRequested) _stopReason = note;
+                        _stopRequested = true;
+                    }
+                    _audit.Log("safe_stop", taskId: task.Id,
+                               details: new Dictionary<string, object?>
+                               {
+                                   ["reason"] = note.Length > 500 ? note[..500] : note,
+                               });
+                }
+                if (report is not null && report.RollbackRun)
+                    task.Status = TaskStatus.RolledBack;
+            }
+            _metrics.RecordTask(
+                task.Id,
+                attempts: task.Attempts > 0 ? task.Attempts : (report?.Attempts ?? 1),
+                retries: report?.Retries ?? 0,
+                durationS: duration,
+                outcome: ok ? "succeeded" : (task.Status == TaskStatus.RolledBack ? "rolled_back" : "failed"),
+                fallbackUsed: report?.FallbackUsed ?? false,
+                rollbackRun: report?.RollbackRun ?? false,
+                mttrS: report?.MttrS);
         }
-        _metrics.RecordTask(
-            task.Id,
-            attempts: task.Attempts > 0 ? task.Attempts : (report?.Attempts ?? 1),
-            retries: report?.Retries ?? 0,
-            durationS: duration,
-            outcome: ok ? "succeeded" : (task.Status == TaskStatus.RolledBack ? "rolled_back" : "failed"),
-            fallbackUsed: report?.FallbackUsed ?? false,
-            rollbackRun: report?.RollbackRun ?? false,
-            mttrS: report?.MttrS);
     }
 
     // ---- blocked / skipped propagation -------------------------------------------
@@ -433,9 +519,8 @@ public sealed class Engine
     // ---- re-plan requests queued by agents ------------------------------------------
     private void ProcessReplanRequests()
     {
-        var requests = _ctx.Get<List<Dictionary<string, object?>>>("replan_requests") ?? new();
+        var requests = _ctx.Take<List<Dictionary<string, object?>>>("replan_requests") ?? new();
         if (requests.Count == 0) return;
-        _ctx.Put("replan_requests", new List<Dictionary<string, object?>>());
         foreach (var req in requests)
         {
             _replan.RequestReplan(

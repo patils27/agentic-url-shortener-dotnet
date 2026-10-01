@@ -3,6 +3,7 @@
 // A static factory (instead of top-level-only setup) so tests can build the
 // app with custom ServiceOptions while production reads the environment.
 
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -90,9 +91,10 @@ public static class ShortenerApp
         {
             var store = context.RequestServices.GetRequiredService<UrlStore>();
             string db;
-            try { store.ListAll(); db = "ok"; }
+            try { store.CheckReady(); db = "ok"; }
             catch (Exception) { db = "error"; }
-            return Results.Ok(new { status = db == "ok" ? "ready" : "degraded", db });
+            return Results.Json(new { status = db == "ok" ? "ready" : "degraded", db },
+                statusCode: db == "ok" ? 200 : 503);
         });
 
         // ---- create short URL ---------------------------------------------------
@@ -117,8 +119,8 @@ public static class ShortenerApp
             {
                 return Results.Json(new { detail = exc.Message }, statusCode: 422);
             }
-            if (body.ExpiresInDays is not null && body.ExpiresInDays <= 0)
-                return Results.Json(new { detail = "expires_in_days must be positive" }, statusCode: 422);
+            if (body.ExpiresInDays is < 1 or > 3650)
+                return Results.Json(new { detail = "expires_in_days must be between 1 and 3650" }, statusCode: 422);
 
             // code selection
             string code;
@@ -231,7 +233,8 @@ public static class ShortenerApp
             if (row is null)
                 return Results.Json(new { detail = "unknown code" }, statusCode: 404);
             if (row.ExpiresAt is not null &&
-                DateTime.TryParse(row.ExpiresAt, out var exp) && exp <= DateTime.UtcNow)
+                DateTimeOffset.TryParse(row.ExpiresAt, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal, out var exp) && exp <= DateTimeOffset.UtcNow)
                 return Results.Json(new { detail = "link expired" }, statusCode: 410);
             store.RecordClick(row.Code, DateTime.UtcNow.ToString("o"),
                               Referrer(context),

@@ -51,12 +51,17 @@ public static class Retry
         Action<int, double, Exception>? onRetry = null,
         Action<int, Exception>? onFailure = null,
         Action<double>? sleepFn = null,
+        CancellationToken cancellationToken = default,
         params Type[] fatalExceptions)
     {
         if (maxAttempts < 1)
             throw new ArgumentOutOfRangeException(nameof(maxAttempts), "max_attempts must be >= 1");
 
-        sleepFn ??= seconds => Thread.Sleep(TimeSpan.FromSeconds(seconds));
+        sleepFn ??= seconds =>
+        {
+            if (cancellationToken.WaitHandle.WaitOne(TimeSpan.FromSeconds(seconds)))
+                cancellationToken.ThrowIfCancellationRequested();
+        };
         var start = NowMonotonic();
         double? firstFailureAt = null;
         var lastError = string.Empty;
@@ -64,10 +69,12 @@ public static class Retry
 
         for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             attempts = attempt;
             try
             {
                 var result = fn();
+                cancellationToken.ThrowIfCancellationRequested();
                 var recovered = NowMonotonic();
                 return new RetryReport
                 {
@@ -87,6 +94,7 @@ public static class Retry
                     // retried — the engine converts them into a safe-stop.
                     throw;
                 }
+                cancellationToken.ThrowIfCancellationRequested();
                 firstFailureAt ??= NowMonotonic();
                 onFailure?.Invoke(attempt, exc);
                 if (attempt < maxAttempts)
@@ -105,15 +113,18 @@ public static class Retry
         object? fallbackResult = null;
         if (fallback is not null)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
                 fallbackResult = fallback();
+                cancellationToken.ThrowIfCancellationRequested();
                 fallbackSucceeded = true;
             }
             catch (Exception exc)
             {
                 if (fatalExceptions.Any(t => t.IsInstanceOfType(exc)))
                     throw;
+                cancellationToken.ThrowIfCancellationRequested();
                 lastError = $"fallback failed: {exc.GetType().Name}: {exc.Message}";
             }
         }

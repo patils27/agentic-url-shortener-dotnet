@@ -64,7 +64,8 @@ public static class BuiltinPolicies
             if (pattern.IsMatch(payload))
                 return new PolicyVerdict
                 {
-                    Allowed = false, Rule = "no_secrets_in_code",
+                    Allowed = false,
+                    Rule = "no_secrets_in_code",
                     Reason = $"secret-like content detected ({label}) in {action.Target}",
                 };
         }
@@ -85,7 +86,8 @@ public static class BuiltinPolicies
         }
         return new PolicyVerdict
         {
-            Allowed = false, Rule = "allowed_write_paths",
+            Allowed = false,
+            Rule = "allowed_write_paths",
             Reason = $"write target {action.Target} is outside allowed roots [{string.Join(", ", allowedRoots)}]",
         };
     }
@@ -99,7 +101,8 @@ public static class BuiltinPolicies
             return null;
         return new PolicyVerdict
         {
-            Allowed = false, Rule = "tests_must_pass_before_release",
+            Allowed = false,
+            Rule = "tests_must_pass_before_release",
             Reason = "release blocked: no passing test report in context",
         };
     }
@@ -116,7 +119,8 @@ public static class BuiltinPolicies
             if (!approved)
                 return new PolicyVerdict
                 {
-                    Allowed = false, Rule = "no_destructive_migration_without_approval",
+                    Allowed = false,
+                    Rule = "no_destructive_migration_without_approval",
                     Reason = "destructive migration requires an explicit approval record",
                 };
         }
@@ -136,7 +140,8 @@ public static class BuiltinPolicies
         if (missing.Count > 0)
             return new PolicyVerdict
             {
-                Allowed = false, Rule = "no_unreviewed_release",
+                Allowed = false,
+                Rule = "no_unreviewed_release",
                 Reason = $"missing approvals for: {string.Join(", ", missing)}",
             };
         return null;
@@ -170,9 +175,7 @@ public sealed class PolicyEngine
             var verdict = rule(action, ctx);
             if (verdict is not null && !verdict.Allowed)
             {
-                var violations = ctx.Get<List<string>>("policy_violations") ?? new List<string>();
-                violations.Add(verdict.Reason);
-                ctx.Put("policy_violations", violations);
+                ctx.AppendToList("policy_violations", verdict.Reason);
                 audit?.Policy(action.Kind, false, verdict.Rule, verdict.Reason);
                 throw new PolicyViolationException($"[{verdict.Rule}] {verdict.Reason}");
             }

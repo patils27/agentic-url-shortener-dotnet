@@ -32,9 +32,14 @@ public sealed class ReplanManager
     private readonly RunContext _ctx;
     private readonly AuditLogger? _audit;
     private readonly MetricsCollector? _metrics;
+    private readonly object _sync = new();
     private readonly Dictionary<string, Dictionary<string, string>> _snapshots = new();
+    private readonly List<Dictionary<string, object?>> _history = new();
 
-    public List<Dictionary<string, object?>> History { get; } = new();
+    public List<Dictionary<string, object?>> History
+    {
+        get { lock (_sync) return ContextSnapshot.Copy(_history); }
+    }
 
     public ReplanManager(Dag dag, RunContext ctx, AuditLogger? audit = null,
                          MetricsCollector? metrics = null)
@@ -53,33 +58,43 @@ public sealed class ReplanManager
 
     // ---- output tracking ----------------------------------------------------
     /// <summary>Record current artifact hashes as the task's output snapshot.</summary>
-    public void SnapshotOutputs(string taskId) =>
-        _snapshots[taskId] = ProducedBy(taskId);
+    public void SnapshotOutputs(string taskId)
+    {
+        lock (_sync) _snapshots[taskId] = ProducedBy(taskId);
+    }
 
     /// <summary>Compare current artifact hashes with the snapshot; report drift.</summary>
     public ChangeEvent? DetectOutputChange(string taskId)
     {
-        var before = _snapshots.GetValueOrDefault(taskId) ?? new Dictionary<string, string>();
-        var current = ProducedBy(taskId);
-        foreach (var (name, newHash) in current)
+        lock (_sync)
         {
-            if (before.TryGetValue(name, out var oldHash) && oldHash != newHash)
-                return new ChangeEvent
-                {
-                    SourceTaskId = taskId, Reason = "task output changed on re-run",
-                    Artifact = name, OldHash = oldHash, NewHash = newHash,
-                };
+            var before = _snapshots.GetValueOrDefault(taskId) ?? new Dictionary<string, string>();
+            var current = ProducedBy(taskId);
+            foreach (var (name, newHash) in current)
+            {
+                if (before.TryGetValue(name, out var oldHash) && oldHash != newHash)
+                    return new ChangeEvent
+                    {
+                        SourceTaskId = taskId,
+                        Reason = "task output changed on re-run",
+                        Artifact = name,
+                        OldHash = oldHash,
+                        NewHash = newHash,
+                    };
+            }
+            foreach (var name in before.Keys)
+            {
+                if (!current.ContainsKey(name))
+                    return new ChangeEvent
+                    {
+                        SourceTaskId = taskId,
+                        Reason = "task output removed on re-run",
+                        Artifact = name,
+                        OldHash = before[name],
+                    };
+            }
+            return null;
         }
-        foreach (var name in before.Keys)
-        {
-            if (!current.ContainsKey(name))
-                return new ChangeEvent
-                {
-                    SourceTaskId = taskId, Reason = "task output removed on re-run",
-                    Artifact = name, OldHash = before[name],
-                };
-        }
-        return null;
     }
 
     // ---- re-plan --------------------------------------------------------------
@@ -93,54 +108,63 @@ public sealed class ReplanManager
         Func<Dag, RunContext, List<string>>? mutate = null,
         List<ChangeEvent>? events = null)
     {
-        var changed = changedTaskIds?.ToList() ?? new List<string>();
-        var added = mutate?.Invoke(_dag, _ctx) ?? new List<string>();
-        var invalidated = new HashSet<string>();
-        foreach (var tid in changed)
-            if (_dag.Tasks.ContainsKey(tid))
-                foreach (var x in _dag.Invalidate(new[] { tid })) invalidated.Add(x);
-        // newly added tasks start pending by construction; their dependents
-        // (if any were added with deps on existing succeeded tasks) are fine.
-        foreach (var tid in added)
-            if (_dag.Tasks.ContainsKey(tid))
-                foreach (var x in _dag.Invalidate(new[] { tid })) invalidated.Add(x);
-
-        var report = new Dictionary<string, object?>
+        lock (_sync)
         {
-            ["reason"] = reason,
-            ["changed"] = changed,
-            ["added"] = added,
-            ["invalidated"] = invalidated.OrderBy(x => x).ToList(),
-            ["events"] = (events ?? new List<ChangeEvent>()).Select(e => (object?)new Dictionary<string, object?>
+            var changed = changedTaskIds?.ToList() ?? new List<string>();
+            var added = mutate?.Invoke(_dag, _ctx) ?? new List<string>();
+            var invalidated = new HashSet<string>();
+            foreach (var tid in changed)
+                if (_dag.Tasks.ContainsKey(tid))
+                    foreach (var x in _dag.Invalidate(new[] { tid })) invalidated.Add(x);
+            // newly added tasks start pending by construction; their dependents
+            // (if any were added with deps on existing succeeded tasks) are fine.
+            foreach (var tid in added)
+                if (_dag.Tasks.ContainsKey(tid))
+                    foreach (var x in _dag.Invalidate(new[] { tid })) invalidated.Add(x);
+
+            var report = new Dictionary<string, object?>
             {
-                ["source_task_id"] = e.SourceTaskId, ["reason"] = e.Reason,
-                ["artifact"] = e.Artifact, ["old_hash"] = e.OldHash, ["new_hash"] = e.NewHash,
-            }).ToList(),
-        };
-        History.Add(report);
-        if (_metrics is not null) _metrics.Replans++;
-        _audit?.Replan(reason, invalidated.OrderBy(x => x).ToList(), added);
-        _ctx.RecordDecision(
-            actor: "orchestrator",
-            decision: $"re-plan triggered: {reason}",
-            rationale: "Upstream outputs changed; downstream work is stale and " +
-                       "must be re-executed under the same governance gates.",
-            basedOn: changed.Concat((events ?? new List<ChangeEvent>())
-                .Where(e => !string.IsNullOrEmpty(e.Artifact)).Select(e => e.Artifact)).ToList(),
-            impact: $"{invalidated.Count} task(s) invalidated, {added.Count} added");
-        return report;
+                ["reason"] = reason,
+                ["changed"] = changed,
+                ["added"] = added,
+                ["invalidated"] = invalidated.OrderBy(x => x).ToList(),
+                ["events"] = (events ?? new List<ChangeEvent>()).Select(e => (object?)new Dictionary<string, object?>
+                {
+                    ["source_task_id"] = e.SourceTaskId,
+                    ["reason"] = e.Reason,
+                    ["artifact"] = e.Artifact,
+                    ["old_hash"] = e.OldHash,
+                    ["new_hash"] = e.NewHash,
+                }).ToList(),
+            };
+            _history.Add(ContextSnapshot.Copy(report));
+            _metrics?.IncrementReplans();
+            _audit?.Replan(reason, invalidated.OrderBy(x => x).ToList(), added);
+            _ctx.RecordDecision(
+                actor: "orchestrator",
+                decision: $"re-plan triggered: {reason}",
+                rationale: "Upstream outputs changed; downstream work is stale and " +
+                           "must be re-executed under the same governance gates.",
+                basedOn: changed.Concat((events ?? new List<ChangeEvent>())
+                    .Where(e => !string.IsNullOrEmpty(e.Artifact)).Select(e => e.Artifact)).ToList(),
+                impact: $"{invalidated.Count} task(s) invalidated, {added.Count} added");
+            return report;
+        }
     }
 
     /// <summary>After a wave, detect tasks whose outputs drifted vs. snapshot.</summary>
     public List<ChangeEvent> CheckWaveForDrift(IEnumerable<string> completedTaskIds)
     {
-        var detected = new List<ChangeEvent>();
-        foreach (var tid in completedTaskIds)
+        lock (_sync)
         {
-            if (!_snapshots.ContainsKey(tid)) continue;
-            var ev = DetectOutputChange(tid);
-            if (ev is not null) detected.Add(ev);
+            var detected = new List<ChangeEvent>();
+            foreach (var tid in completedTaskIds)
+            {
+                if (!_snapshots.ContainsKey(tid)) continue;
+                var ev = DetectOutputChange(tid);
+                if (ev is not null) detected.Add(ev);
+            }
+            return detected;
         }
-        return detected;
     }
 }

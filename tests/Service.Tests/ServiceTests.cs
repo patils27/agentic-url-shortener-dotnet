@@ -179,6 +179,84 @@ public sealed class ServiceTests : IDisposable
         Assert.Equal("ok", Body(await resp.Content.ReadAsStringAsync()).GetProperty("status").GetString());
     }
 
+    [Fact]
+    public async Task Readiness_EmptyDatabase_ReturnsReady200()
+    {
+        using var response = await Client().GetAsync("/ready");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = Body(await response.Content.ReadAsStringAsync());
+        Assert.Equal("ready", body.GetProperty("status").GetString());
+        Assert.Equal("ok", body.GetProperty("db").GetString());
+    }
+
+    [Fact]
+    public async Task Readiness_UnavailableDatabase_ReturnsDegraded503()
+    {
+        // The parent directory intentionally does not exist; no database is created.
+        using var factory = new ShortenerTestFactory(new ServiceOptions
+        {
+            DbPath = Path.Combine(Path.GetTempPath(), $"missing-{Guid.NewGuid():N}", "ready.db"),
+        });
+        using var client = factory.CreateClient();
+        using var response = await client.GetAsync("/ready");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        var body = Body(await response.Content.ReadAsStringAsync());
+        Assert.Equal("degraded", body.GetProperty("status").GetString());
+        Assert.Equal("error", body.GetProperty("db").GetString());
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/health")).StatusCode);
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(0)]
+    [InlineData(3651)]
+    [InlineData(int.MaxValue)]
+    public async Task Create_InvalidExpiryDays_Returns422WithoutSaving(int days)
+    {
+        using var response = await Client().PostAsJsonAsync("/api/urls",
+            new { url = "https://example.com", expires_in_days = days });
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
+        Assert.Contains("between 1 and 3650",
+            Body(await response.Content.ReadAsStringAsync()).GetProperty("detail").GetString());
+        Assert.Empty(_factory.Services.GetRequiredService<UrlStore>().ListAll());
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3650)]
+    public async Task Create_ExpiryDayBounds_AreAccepted(int days)
+    {
+        using var response = await Client().PostAsJsonAsync("/api/urls",
+            new { url = "https://example.com", expires_in_days = days });
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var body = Body(await response.Content.ReadAsStringAsync());
+        var created = DateTimeOffset.Parse(body.GetProperty("created_at").GetString()!);
+        var expires = DateTimeOffset.Parse(body.GetProperty("expires_at").GetString()!);
+        Assert.Equal(TimeSpan.FromDays(days), expires - created);
+    }
+
+    [Theory]
+    [InlineData(1, -14)]
+    [InlineData(1, 0)]
+    [InlineData(1, 14)]
+    [InlineData(-1, -14)]
+    [InlineData(-1, 0)]
+    [InlineData(-1, 14)]
+    public async Task Redirect_ExpiryUsesAbsoluteTime(int hoursFromNow, int offsetHours)
+    {
+        // Offsets change the timestamp's wall-clock representation, not its expiry instant.
+        var now = DateTimeOffset.UtcNow;
+        var expiry = now.AddHours(hoursFromNow).ToOffset(TimeSpan.FromHours(offsetHours));
+        var store = _factory.Services.GetRequiredService<UrlStore>();
+        Assert.True(store.Create("offset-expiry", "https://example.com",
+            now.ToString("o"), expiry.ToString("o")));
+
+        using var response = await Client(followRedirects: false).GetAsync("/offset-expiry");
+        Assert.Equal(hoursFromNow > 0 ? HttpStatusCode.TemporaryRedirect : HttpStatusCode.Gone,
+            response.StatusCode);
+        Assert.Equal(hoursFromNow > 0 ? 1 : 0, store.ClickCount("offset-expiry"));
+    }
+
     // 2 ------------------------------------------------------------------
     [Fact]
     public async Task Create_Then_Redirect_307()
@@ -319,6 +397,7 @@ public sealed class ServiceTests : IDisposable
 
         // health bypasses the limiter
         Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/health")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/ready")).StatusCode);
     }
 
     // 11 ------------------------------------------------------------------

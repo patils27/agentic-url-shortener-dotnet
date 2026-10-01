@@ -18,5 +18,6 @@ public sealed class AgentResult
 public interface IAgent
 {
     string Name { get; }
-    AgentResult Run(RunContext ctx, TaskNode task);
+    // Implementations must observe cancellation before side effects and during blocking work.
+    AgentResult Run(RunContext ctx, TaskNode task, CancellationToken cancellationToken = default);
 }

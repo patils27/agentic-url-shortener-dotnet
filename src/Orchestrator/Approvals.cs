@@ -34,6 +34,8 @@ public class ApprovalManager
 {
     private readonly bool _auto;
     private readonly string _autoActor;
+    private readonly SemaphoreSlim _promptLock = new(1, 1);
+    private readonly AsyncLocal<CancellationToken> _promptCancellation = new();
 
     public ApprovalManager(bool auto = false, string autoActor = "auto-approver")
     {
@@ -43,13 +45,18 @@ public class ApprovalManager
 
     public ApprovalVerdict Request(RunContext ctx, string taskId, string summary,
                                    string impact, string requestedBy,
-                                   AuditLogger? audit = null)
+                                   AuditLogger? audit = null,
+                                   CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var ts = RunContext.NowIso();
         var req = new ApprovalRequest
         {
-            TaskId = taskId, Summary = summary, Impact = impact,
-            RequestedBy = requestedBy, Timestamp = ts,
+            TaskId = taskId,
+            Summary = summary,
+            Impact = impact,
+            RequestedBy = requestedBy,
+            Timestamp = ts,
         };
 
         ApprovalVerdict verdict;
@@ -57,15 +64,30 @@ public class ApprovalManager
         {
             verdict = new ApprovalVerdict
             {
-                Approved = true, Actor = _autoActor, Timestamp = ts,
+                Approved = true,
+                Actor = _autoActor,
+                Timestamp = ts,
                 Reason = "auto-approved: --auto mode; approval checkpoint still " +
                          "enforced and logged, human retains final review of artifacts",
             };
         }
         else
         {
-            verdict = PromptHuman(req);
+            _promptLock.Wait(cancellationToken);
+            var previousToken = _promptCancellation.Value;
+            try
+            {
+                _promptCancellation.Value = cancellationToken;
+                cancellationToken.ThrowIfCancellationRequested();
+                verdict = PromptHuman(req);
+            }
+            finally
+            {
+                _promptCancellation.Value = previousToken;
+                _promptLock.Release();
+            }
         }
+        cancellationToken.ThrowIfCancellationRequested();
 
         var record = new Dictionary<string, object?>
         {
@@ -98,10 +120,46 @@ public class ApprovalManager
         Console.WriteLine($"Impact : {req.Impact}");
         Console.WriteLine($"Asked by agent: {req.RequestedBy}");
         Console.Write("Approve? [y/N] ");
-        var answer = (Console.ReadLine() ?? string.Empty).Trim().ToLowerInvariant();
+        var answer = ReadAnswer(_promptCancellation.Value).Trim().ToLowerInvariant();
         var ts = RunContext.NowIso();
         return answer is "y" or "yes"
             ? new ApprovalVerdict { Approved = true, Actor = "human", Reason = "approved interactively", Timestamp = ts }
             : new ApprovalVerdict { Approved = false, Actor = "human", Reason = "denied interactively — run will safe-stop", Timestamp = ts };
+    }
+
+    private static string ReadAnswer(CancellationToken cancellationToken)
+    {
+        // Redirected input and custom PromptHuman overrides may block until their
+        // reader returns. The engine keeps their worker alive until it exits.
+        if (Console.IsInputRedirected)
+            return Console.ReadLine() ?? string.Empty;
+
+        var answer = new System.Text.StringBuilder();
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!Console.KeyAvailable)
+            {
+                if (cancellationToken.WaitHandle.WaitOne(50))
+                    cancellationToken.ThrowIfCancellationRequested();
+                continue;
+            }
+            var key = Console.ReadKey(intercept: true);
+            if (key.Key == ConsoleKey.Enter)
+            {
+                Console.WriteLine();
+                return answer.ToString();
+            }
+            if (key.Key == ConsoleKey.Backspace && answer.Length > 0)
+            {
+                answer.Length--;
+                Console.Write("\b \b");
+            }
+            else if (!char.IsControl(key.KeyChar))
+            {
+                answer.Append(key.KeyChar);
+                Console.Write(key.KeyChar);
+            }
+        }
     }
 }

@@ -79,34 +79,39 @@ public sealed class PlannerAgent : Agent
         };
     }
 
-    public override AgentResult Run(RunContext ctx, TaskNode task)
+    public override AgentResult Run(RunContext ctx, TaskNode task, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var mode = StrParam(task, "mode", "decompose");
         return mode switch
         {
-            "clarify" => Clarify(ctx, task),
-            "inject_clarification" => InjectClarification(ctx, task),
-            _ => Decompose(ctx, task),
+            "clarify" => Clarify(ctx, task, cancellationToken),
+            "inject_clarification" => InjectClarification(ctx, task, cancellationToken),
+            _ => Decompose(ctx, task, cancellationToken),
         };
     }
 
     // ------------------------------------------------------------------
-    private AgentResult Decompose(RunContext ctx, TaskNode task)
+    private AgentResult Decompose(RunContext ctx, TaskNode task, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var requirement = StrParam(task, "requirement");
         var kind = StrParam(task, "scenario_kind", "greenfield");
         var analysis = DetectAmbiguity(requirement);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("ambiguity_analysis", analysis);
         var vagueTerms = (List<string>)analysis["vague_terms"]!;
         var vagueDesc = vagueTerms.Count == 0 ? "none" : string.Join(", ", vagueTerms);
-        Decide(ctx,
+        Decide(ctx, cancellationToken,
             $"requirement classified as {(analysis["ambiguous"] is true ? "AMBIGUOUS" : "WELL-DEFINED")} (score {analysis["score"]})",
             $"vague terms: {vagueDesc}; measurable criteria: {analysis["has_measurable_criteria"]}",
             basedOn: new List<string> { "requirement text" },
             impact: "drives decomposition strategy and clarification checkpoints");
 
         var normalized = Normalize(requirement, kind);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("normalized_requirement", normalized);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.AddArtifact("normalized_requirement", "data",
                         producedBy: $"planner:{task.Id}",
                         content: JsonSerializer.Serialize(normalized,
@@ -123,14 +128,17 @@ public sealed class PlannerAgent : Agent
             ["requirement"] = requirement, ["normalized"] = normalized,
             ["tasks"] = specs,
         };
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("plan", plan);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.AddArtifact("plan", "data", producedBy: $"planner:{task.Id}",
                         content: JsonSerializer.Serialize(plan));
-        Decide(ctx,
+        Decide(ctx, cancellationToken,
             $"decomposed '{kind}' scope into {specs.Count} tasks with explicit dependencies",
             "independent modules/docs fan out in parallel; integration points (tests, release) are join barriers",
             basedOn: new List<string> { "normalized requirement" },
             impact: $"{specs.Count} DAG nodes; release gate is the final barrier");
+        cancellationToken.ThrowIfCancellationRequested();
         return Ok(new Dictionary<string, object?> { ["plan"] = plan },
                   artifacts: new List<string> { "plan" });
     }
@@ -297,20 +305,23 @@ public sealed class PlannerAgent : Agent
     }
 
     // ------------------------------------------------------------------
-    private AgentResult Clarify(RunContext ctx, TaskNode task)
+    private AgentResult Clarify(RunContext ctx, TaskNode task, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         // Re-run after a re-plan must not regress a confirmed clarification.
         if (ctx.Get("clarified_requirement") is not null)
         {
-            Decide(ctx, "keep confirmed clarification on re-run",
+            Decide(ctx, cancellationToken, "keep confirmed clarification on re-run",
                 "clarified requirement already exists; re-affirming instead of re-guessing",
                 basedOn: new List<string> { "clarified_requirement" });
+            cancellationToken.ThrowIfCancellationRequested();
             return Ok(new Dictionary<string, object?> { ["clarified"] = true },
                       notes: "clarification already confirmed");
         }
 
         var requirement = StrParam(task, "requirement");
         var analysis = DetectAmbiguity(requirement);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("ambiguity_analysis", analysis);
 
         var assumptions = new[]
@@ -321,7 +332,11 @@ public sealed class PlannerAgent : Agent
             "all new behavior must be backward compatible with v1 clients",
             "scope is limited to link intelligence, not analytics UI",
         };
-        foreach (var stmt in assumptions) ctx.LogAssumption(Name, stmt);
+        foreach (var stmt in assumptions)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ctx.LogAssumption(Name, stmt);
+        }
 
         var hypothesis = new Dictionary<string, object?>
         {
@@ -336,11 +351,13 @@ public sealed class PlannerAgent : Agent
                 "device-specific redirect targets (needs product confirmation)",
             },
         };
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("normalized_requirement", hypothesis);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.AddArtifact("normalized_requirement", "data",
                         producedBy: $"planner:{task.Id}",
                         content: JsonSerializer.Serialize(hypothesis));
-        Decide(ctx,
+        Decide(ctx, cancellationToken,
             "normalized 'make short links smarter' into an explicit hypothesis with 5 logged assumptions",
             $"ambiguity score {analysis["score"]} (vague terms: {string.Join(", ", (List<string>)analysis["vague_terms"]!)}); " +
             "proceeding with a documented hypothesis and a clarification checkpoint instead of stalling",
@@ -351,16 +368,21 @@ public sealed class PlannerAgent : Agent
                 "block for clarification before any work",
                 "pick device-routing as the hypothesis",
             });
+        cancellationToken.ThrowIfCancellationRequested();
         return Ok(new Dictionary<string, object?> { ["hypothesis"] = hypothesis },
                   notes: "hypothesis recorded; clarification pending",
                   artifacts: new List<string> { "normalized_requirement" });
     }
 
-    private AgentResult InjectClarification(RunContext ctx, TaskNode task)
+    private AgentResult InjectClarification(RunContext ctx, TaskNode task, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (ctx.GetFlagBool("clarification_injected"))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
             return Ok(new Dictionary<string, object?> { ["already_injected"] = true },
                       notes: "clarification already applied");
+        }
 
         var clarified = new Dictionary<string, object?>
         {
@@ -373,26 +395,33 @@ public sealed class PlannerAgent : Agent
             },
             ["non_goals"] = new List<string> { "analytics UI changes" },
         };
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("clarified_requirement", clarified);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("normalized_requirement", clarified);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.AddArtifact("normalized_requirement", "data",
                         producedBy: $"planner:{task.Id}",
                         content: JsonSerializer.Serialize(clarified));
         foreach (var aid in new[] { "A01", "A02", "A03", "A04", "A05" })
+        {
+            cancellationToken.ThrowIfCancellationRequested();
             ctx.ResolveAssumption(aid, "confirmed", "stakeholder");
+        }
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.SetFlag("clarification_injected");
-        var requests = ctx.Get<List<Dictionary<string, object?>>>("replan_requests") ?? new();
-        requests.Add(new Dictionary<string, object?>
+        cancellationToken.ThrowIfCancellationRequested();
+        ctx.AppendToList("replan_requests", new Dictionary<string, object?>
         {
             ["reason"] = "stakeholder clarification received: 'smarter' = device-aware smart redirects + link health monitoring (supersedes planner hypothesis)",
             ["changed_task_ids"] = new List<string> { "clarify" },
         });
-        ctx.Put("replan_requests", requests);
-        Decide(ctx,
+        Decide(ctx, cancellationToken,
             "applied stakeholder clarification; queued re-plan",
             "confirmed scope (device-aware redirects + health) differs from the planner hypothesis (health only); downstream artifacts are stale and must be rebuilt",
             basedOn: new List<string> { "stakeholder clarification", "assumption log" },
             impact: "re-plan invalidates clarify + all downstream tasks; they re-execute under the same gates and approvals");
+        cancellationToken.ThrowIfCancellationRequested();
         return Ok(new Dictionary<string, object?> { ["clarified"] = clarified },
                   notes: "clarification applied; re-plan queued");
     }

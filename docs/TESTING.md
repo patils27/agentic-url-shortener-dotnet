@@ -34,7 +34,7 @@ orchestration framework):
 
 ## 2. What is covered
 
-**`ServiceTests` (23 cases):** health/readiness, create + redirect,
+**`ServiceTests` (37 cases):** health/readiness, create + redirect,
 click recording, analytics aggregation (totals, per-day,
 referrer/user-agent, `last_clicked_at`), idempotency (`Idempotency-Key`
 replay returns the same body), rate limiting (429 + `Retry-After`,
@@ -44,6 +44,10 @@ health bypass), URL/alias validators, custom alias creation and
 Additional regression cases verify concurrent idempotency over HTTP and across
 SQLite connections, collision rollback, reserved aliases, and trusted-proxy
 handling for rate limiting and click IPs.
+Expiry cases cover 1..3650-day bounds and future/past instants with explicit
+offsets. Readiness cases cover empty storage, unavailable storage returning 503,
+and probe bypass of rate limits. Run these cases in a non-UTC environment as well
+as UTC: the original local-time comparison bug is only observable outside UTC.
 
 **`OrchestratorTests` (15 tests):** DAG execution order, parallel wave
 overlap (real timing overlap, not just completion), gate blocking, retry
@@ -56,9 +60,20 @@ safe-stop on fallback policy violations.
 **`AgentTests` (2 tests):** simultaneous draining of large stdout/stderr streams
 and timeout handling for hung child processes.
 
+**`AgentCancellationTests` (11 cases):** pre-cancelled agents, cancellation
+during a policy-checked write, and termination of a subprocess tree.
+
+**`EngineCancellationTests` (8 cases):** retain concurrency slots until agents
+exit, reject late success, interrupt retry backoff, compensate once after
+shutdown, preserve fatal policy exceptions, and log only actual fallback calls.
+
+**`SharedStateTests` (8 cases):** parallel context and metric writers, detached
+nested snapshots, atomic queue operations, synchronized replan snapshots and
+policy denials, and serialized/cancel-aware approvals.
+
 **Generated variant suites** (run inside scenario workspaces by the
-tester agent): v1 = 9 tests, v2 = 12 tests, smart health-only = 15,
-smart full = 18.
+tester agent): v1 = 19 cases, v2 = 22 cases, smart health-only = 25,
+smart full = 28.
 
 ## 3. How to run
 
@@ -69,7 +84,7 @@ export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 
 # From the repo root
 dotnet test AgenticUrlShortener.sln --nologo -v q
-# -> 40 passed (23 + 17), 0 failed
+# -> 81 passed (37 + 44), 0 failed
 ```
 
 **Environment quirk (important):** VSTest opens a dual-mode local socket

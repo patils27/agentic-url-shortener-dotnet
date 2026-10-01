@@ -61,8 +61,9 @@ public sealed class TesterAgent : Agent
         };
     }
 
-    public override AgentResult Run(RunContext ctx, TaskNode task)
+    public override AgentResult Run(RunContext ctx, TaskNode task, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var ws = StrParam(task, "workspace_dir");
         var testProject = StrParam(task, "test_project",
             "Shortener.Tests/Shortener.Tests.csproj");
@@ -76,6 +77,7 @@ public sealed class TesterAgent : Agent
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
+            CreateNoWindow = true,
         };
         psi.ArgumentList.Add("test");
         psi.ArgumentList.Add(testProject);
@@ -92,7 +94,8 @@ public sealed class TesterAgent : Agent
             psi.Environment["PATH"] = homeDotnet +
                 Path.PathSeparator + (psi.Environment["PATH"] ?? "");
 
-        var (exitCode, stdout, stderr) = RunProcess(psi, TimeSpan.FromSeconds(task.TimeoutS));
+        var (exitCode, stdout, stderr) = RunProcess(psi, TimeSpan.FromSeconds(task.TimeoutS), cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         var output = (stdout + "\n" + stderr);
         var tail = output.Length > 6000 ? output[^6000..] : output;
         var counts = ParseTestOutput(stdout);
@@ -108,11 +111,13 @@ public sealed class TesterAgent : Agent
             ["counts"] = counts,
             ["output_tail"] = tail,
         };
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.Put("test_report", report);
+        cancellationToken.ThrowIfCancellationRequested();
         ctx.AddArtifact("test_report", "data",
                         producedBy: $"tester:{task.Id}",
                         content: System.Text.Json.JsonSerializer.Serialize(report));
-        Decide(ctx,
+        Decide(ctx, cancellationToken,
             $"test gate {(ok ? "PASSED" : "FAILED")}: {counts["passed"]} passed, " +
             $"{counts["failed"]} failed, {counts["errors"]} errors",
             $"dotnet test executed against the workspace build; returncode={exitCode}",
@@ -123,23 +128,45 @@ public sealed class TesterAgent : Agent
             // Fail the task so bounded retries / fallback / rollback engage.
             throw new InvalidOperationException(
                 $"test suite failed: {notes}\n{tail[^Math.Min(2000, tail.Length)..]}");
+        cancellationToken.ThrowIfCancellationRequested();
         return Ok(new Dictionary<string, object?> { ["test_report"] = report },
                   notes: notes, artifacts: new List<string> { "test_report" });
     }
 
     internal static (int ExitCode, string Stdout, string Stderr) RunProcess(
-        ProcessStartInfo startInfo, TimeSpan timeout)
+        ProcessStartInfo startInfo, TimeSpan timeout, CancellationToken cancellationToken = default) =>
+        RunProcessAsync(startInfo, timeout, cancellationToken).GetAwaiter().GetResult();
+
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunProcessAsync(
+        ProcessStartInfo startInfo, TimeSpan timeout, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var timeoutCancellation = new CancellationTokenSource(timeout);
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken, timeoutCancellation.Token);
         using var proc = Process.Start(startInfo)
             ?? throw new InvalidOperationException("could not start dotnet test");
         // Drain both pipes while the child runs so a full buffer cannot block exit.
         var stdoutTask = proc.StandardOutput.ReadToEndAsync();
         var stderrTask = proc.StandardError.ReadToEndAsync();
-        if (!proc.WaitForExit((int)timeout.TotalMilliseconds))
+        try
         {
-            try { proc.Kill(entireProcessTree: true); } catch (Exception) { }
+            await proc.WaitForExitAsync(stop.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested)
+        {
+            try { proc.Kill(entireProcessTree: true); }
+            catch (InvalidOperationException) when (proc.HasExited) { }
+            // Cancellation only completes after the subprocess has stopped and
+            // its output has been consumed, so retries cannot overlap it.
+            await proc.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+            await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
             throw new TimeoutException($"dotnet test timed out after {timeout.TotalSeconds}s");
         }
-        return (proc.ExitCode, stdoutTask.GetAwaiter().GetResult(), stderrTask.GetAwaiter().GetResult());
+        var stdout = await stdoutTask.ConfigureAwait(false);
+        var stderr = await stderrTask.ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        return (proc.ExitCode, stdout, stderr);
     }
 }
