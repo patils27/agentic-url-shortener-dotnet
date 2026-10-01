@@ -68,7 +68,7 @@ public sealed class ArchitectAgent : Agent
             new() { ["method"] = "POST", ["path"] = "/api/urls",
                     ["description"] = "Create a short URL (7-char code, optional expiry). Supports Idempotency-Key." },
             new() { ["method"] = "GET", ["path"] = "/api/urls",
-                    ["description"] = "List all short URLs with click counts." },
+                    ["description"] = "List the authenticated owner's short URLs with click counts." },
             new() { ["method"] = "GET", ["path"] = "/api/urls/{code}",
                     ["description"] = "Get one short URL." },
             new() { ["method"] = "DELETE", ["path"] = "/api/urls/{code}",
@@ -93,9 +93,9 @@ public sealed class ArchitectAgent : Agent
             ["api_spec"] = apiSpec,
             ["data_model"] = new List<string>
             {
-                "urls(code PK, url, created_at, expires_at)",
+                "urls(code PK, url, created_at, expires_at, owner_id)",
                 "clicks(id, code, ts, referrer, user_agent, ip)",
-                "idempotency(key PK, body, created_at)",
+                "idempotency_requests(owner_id + key PK, request_hash, body, expires_at)",
             },
         };
         cancellationToken.ThrowIfCancellationRequested();

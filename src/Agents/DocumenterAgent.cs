@@ -52,6 +52,10 @@ public sealed class DocumenterAgent : Agent
         {
             "# URL Shortener — API Reference", "",
             "Base URL: `http://localhost:8000`", "",
+            "## Authentication and ownership", "",
+            "Configure `SHORTENER_API_KEYS` as a JSON object mapping stable owner IDs to unique secret keys (32-512 printable ASCII characters without spaces). Send `X-Api-Key` on every `/api/*` request. Use HTTPS outside localhost.",
+            "Missing/invalid credentials return `401`; absent configuration returns `503`. Management and analytics are owner-scoped; another owner's code returns `404`. Redirects and probes remain public.",
+            "Existing links migrate with no owner and remain redirectable; no caller can automatically claim them. Legacy unscoped idempotency responses are not replayed.", "",
             "## Endpoints", "",
         };
         foreach (var ep in spec)
@@ -64,7 +68,7 @@ public sealed class DocumenterAgent : Agent
         {
             "## Reliability", "",
             "- **Rate limiting:** 60 requests/minute per client IP (token bucket); `429` responses carry a `Retry-After` header.",
-            "- **Idempotency:** send `Idempotency-Key` with `POST /api/urls`; replays return the original body with `200`.",
+            "- **Idempotency:** send a single `Idempotency-Key` (1-128 printable ASCII characters without spaces). Keys are scoped to owner and validated request for 24 hours. Matching replays return the original body with `200`; changed requests return `422`. Expired records are purged on subsequent keyed creates. Deleting a link does not invalidate its saved response.",
             "- **Expiry:** links created with `expires_in_days` return `410 Gone` after expiry.",
             "", "## Analytics", "",
             "`GET /api/urls/{code}/stats` returns total clicks, per-day counts, and referrer / user-agent breakdowns.",

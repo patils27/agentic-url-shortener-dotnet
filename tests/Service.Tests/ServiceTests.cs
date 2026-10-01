@@ -16,11 +16,14 @@ namespace AgenticUrlShortener.Service.Tests;
 
 public sealed class ShortenerTestFactory : WebApplicationFactory<Program>
 {
+    public const string TestKey = "test-only-key-0123456789-abcdefghijklmnopqrstuvwxyz";
+    private readonly bool _authenticate;
     private readonly ServiceOptions _options;
     private readonly IPAddress? _remoteIp;
 
-    public ShortenerTestFactory(ServiceOptions? options = null, IPAddress? remoteIp = null)
+    public ShortenerTestFactory(ServiceOptions? options = null, IPAddress? remoteIp = null, bool authenticate = true)
     {
+        _authenticate = authenticate;
         _remoteIp = remoteIp;
         _options = options ?? new ServiceOptions
         {
@@ -29,6 +32,13 @@ public sealed class ShortenerTestFactory : WebApplicationFactory<Program>
             RatePerMinute = 6000,
             RateBurst = 1000,
         };
+        if (authenticate) _options.ApiKeys["test-owner"] = TestKey;
+    }
+
+    protected override void ConfigureClient(HttpClient client)
+    {
+        base.ConfigureClient(client);
+        if (_authenticate) client.DefaultRequestHeaders.Add(ApiKeyAuthentication.HeaderName, TestKey);
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -86,13 +96,14 @@ public sealed class ServiceTests : IDisposable
         {
             Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(10)));
             return store.CreateWithIdempotency($"code{index}", "https://example.com", DateTime.UtcNow.ToString("o"),
-                null, "shared-key", $"response{index}");
+                null, "test-owner", "shared-key", "same-request", $"response{index}");
         }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)));
-        Assert.Single(results, r => r.Created);
+        Assert.Single(results, r => r.Outcome == CreateUrlOutcome.Created);
         var replay = Assert.Single(results, r => r.Replay is not null).Replay;
         var row = Assert.Single(stores[0].ListAll());
         Assert.Equal("response" + row.Code[^1], replay);
-        Assert.Equal(replay, stores[1].GetIdempotency("shared-key"));
+        Assert.Equal(replay, stores[1].GetIdempotency("test-owner", "shared-key")?.Body);
+        foreach (var store in stores) store.Dispose();
     }
 
     [Fact]
@@ -101,12 +112,12 @@ public sealed class ServiceTests : IDisposable
         var store = _factory.Services.GetRequiredService<UrlStore>();
         var now = DateTime.UtcNow.ToString("o");
         Assert.True(store.Create("existing", "https://example.com", now));
-        Assert.Equal((false, (string?)null), store.CreateWithIdempotency(
-            "existing", "https://example.com/new", now, null, "new-key", "new-response"));
-        Assert.Null(store.GetIdempotency("new-key"));
-        Assert.Equal((true, (string?)null), store.CreateWithIdempotency(
-            "available", "https://example.com/new", now, null, "new-key", "new-response"));
-        Assert.Equal("new-response", store.GetIdempotency("new-key"));
+        Assert.Equal(CreateUrlOutcome.CodeConflict, store.CreateWithIdempotency(
+            "existing", "https://example.com/new", now, null, "test-owner", "new-key", "hash", "new-response").Outcome);
+        Assert.Null(store.GetIdempotency("test-owner", "new-key"));
+        Assert.Equal(CreateUrlOutcome.Created, store.CreateWithIdempotency(
+            "available", "https://example.com/new", now, null, "test-owner", "new-key", "hash", "new-response").Outcome);
+        Assert.Equal("new-response", store.GetIdempotency("test-owner", "new-key")?.Body);
     }
 
     [Theory]

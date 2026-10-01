@@ -42,12 +42,16 @@ All projects target `net10.0`.
 dotnet test AgenticUrlShortener.sln --nologo -v q
 ```
 
-81/81 passing: 37 service cases + 44 orchestrator/agent cases. Generated
+105/105 passing: 61 service cases + 44 orchestrator/agent cases. Generated
 scenario workspaces under `runs/*/workspace/` are ordinary directories
 (not in the solution), so their own suites are never collected by the
 repo test run. Details in [docs/TESTING.md](docs/TESTING.md).
 
 ## Running the service
+
+Management endpoints now require an API key. See [API access and migration](docs/API_ACCESS.md)
+for PowerShell setup, Visual Studio debugging, and upgrading an existing database.
+Configure `SHORTENER_API_KEYS` before starting the service.
 
 ```bash
 SHORTENER_DB=/tmp/demo.db \
@@ -60,6 +64,7 @@ dotnet src/Service/bin/Debug/net10.0/AgenticUrlShortener.Service.dll
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `SHORTENER_API_KEYS` | (empty; management returns 503) | JSON object mapping stable owner IDs to secret API keys |
 | `SHORTENER_DB` | `shortener.db` | SQLite file path (`:memory:` in tests) |
 | `SHORTENER_BASE_URL` | `http://localhost:8000` | Base URL used in generated `short_url` fields |
 | `SHORTENER_RATE_PER_MINUTE` | `60` | Token-bucket refill rate per IP |
@@ -69,10 +74,14 @@ dotnet src/Service/bin/Debug/net10.0/AgenticUrlShortener.Service.dll
 
 ### API endpoints
 
+All `/api/*` requests require `X-Api-Key`. Management and analytics are scoped to
+the authenticated owner; other owners' codes return `404`. Redirects and probes
+remain public. Existing links remain redirectable but unowned after migration.
+
 | Method | Path | Notes |
 |---|---|---|
 | `POST` | `/api/urls` | Create short URL → `201`; `Idempotency-Key` header replays → `200` same body |
-| `GET` | `/api/urls` | List all short URLs |
+| `GET` | `/api/urls` | List the caller's short URLs |
 | `GET` | `/api/urls/{code}` | Fetch one |
 | `DELETE` | `/api/urls/{code}` | Delete → `204` |
 | `GET` | `/api/urls/{code}/stats` | Click analytics: totals, per-day, referrer/UA breakdown, `last_clicked_at` |
@@ -95,31 +104,34 @@ Forwarded IP headers are ignored by default. When using a reverse proxy, set
 `SHORTENER_TRUSTED_PROXIES` to its immediate peer IP address. The service consumes
 one forwarded hop, from the right of the header; the proxy must append or replace
 the client IP. The validated IP is used for both rate limiting and click analytics.
-Aliases `health` and `ready` are reserved, regardless of case. Concurrent creates
-with the same idempotency key return one saved response and create one URL.
+Aliases `api`, `health` and `ready` are reserved, regardless of case. Concurrent
+creates with the same owner, idempotency key, and validated request return one
+saved response and create one URL. Changed requests return `422`; replay records
+expire after 24 hours.
 
 `/ready` performs a bounded database query and returns `503` with
 `{"status":"degraded","db":"error"}` when storage cannot be queried.
 `/health` remains a separate liveness check.
 
-### Demo sequence (verified live)
+### Demo sequence
 
 ```bash
 B=http://127.0.0.1:8000
+# Set SHORTENER_KEY to the key configured for this caller.
 # create — custom alias -> 201 Created
-curl -X POST $B/api/urls -H 'Content-Type: application/json' \
+curl -X POST $B/api/urls -H "X-Api-Key: $SHORTENER_KEY" -H 'Content-Type: application/json' \
   -d '{"url":"https://example.com/docs","custom_alias":"demo-link"}'
 
 # redirect -> 307 Temporary Redirect + location: https://example.com/docs
 curl -D - $B/demo-link
 
 # analytics -> {"total_clicks": 1, "clicks_by_day": [...], ...}
-curl $B/api/urls/demo-link/stats
+curl $B/api/urls/demo-link/stats -H "X-Api-Key: $SHORTENER_KEY"
 
 # idempotent replay -> 201 then 200 with the identical body
-curl -X POST $B/api/urls -H 'Content-Type: application/json' \
+curl -X POST $B/api/urls -H "X-Api-Key: $SHORTENER_KEY" -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: abc123' -d '{"url":"https://example.com/docs"}'
-curl -X POST $B/api/urls -H 'Content-Type: application/json' \
+curl -X POST $B/api/urls -H "X-Api-Key: $SHORTENER_KEY" -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: abc123' -d '{"url":"https://example.com/docs"}'
 
 # expired link -> 410 ; unknown code -> 404 ; alias conflict -> 409

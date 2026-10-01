@@ -49,6 +49,13 @@ offsets. Readiness cases cover empty storage, unavailable storage returning 503,
 and probe bypass of rate limits. Run these cases in a non-UTC environment as well
 as UTC: the original local-time comparison bug is only observable outside UTC.
 
+**`AccessTests` (24 cases):** missing/invalid/multiple credentials, fail-closed
+configuration, public redirects and probes, cross-owner isolation, owner-scoped
+idempotency, changed requests and concurrent conflicts, normalized replays,
+invalid key headers, reserved API aliases, legacy migration, key rotation, and
+24-hour replay expiry using a controlled clock. Generated suites also check
+authentication, ownership, and request matching; smart suites check health access.
+
 **`OrchestratorTests` (15 tests):** DAG execution order, parallel wave
 overlap (real timing overlap, not just completion), gate blocking, retry
 recovery + metrics accounting, retry-exhaustion → rollback, fallback
@@ -72,8 +79,8 @@ nested snapshots, atomic queue operations, synchronized replan snapshots and
 policy denials, and serialized/cancel-aware approvals.
 
 **Generated variant suites** (run inside scenario workspaces by the
-tester agent): v1 = 19 cases, v2 = 22 cases, smart health-only = 25,
-smart full = 28.
+tester agent): v1 = 22 cases, v2 = 25 cases, smart health-only = 29,
+smart full = 32.
 
 ## 3. How to run
 
@@ -84,7 +91,7 @@ export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 
 # From the repo root
 dotnet test AgenticUrlShortener.sln --nologo -v q
-# -> 81 passed (37 + 44), 0 failed
+# -> 105 passed (61 + 44), 0 failed
 ```
 
 **Environment quirk (important):** VSTest opens a dual-mode local socket

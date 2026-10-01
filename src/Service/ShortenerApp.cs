@@ -5,7 +5,6 @@
 
 using System.Globalization;
 using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.HttpOverrides;
 
@@ -14,15 +13,12 @@ namespace AgenticUrlShortener.Service;
 public static class ShortenerApp
 {
     private const string Alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-
-    internal static string GenerateCode(RandomNumberGenerator rng, int length = 7)
+    private static readonly JsonSerializerOptions JsonOptions = new()
     {
-        var sb = new StringBuilder(length);
-        var bytes = new byte[length];
-        rng.GetBytes(bytes);
-        foreach (var b in bytes) sb.Append(Alphabet[b % Alphabet.Length]);
-        return sb.ToString();
-    }
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+    };
+
+    internal static string GenerateCode(int length = 7) => RandomNumberGenerator.GetString(Alphabet, length);
 
     public static WebApplication CreateApp(ServiceOptions? options = null)
     {
@@ -30,6 +26,7 @@ public static class ShortenerApp
 
         var builder = WebApplication.CreateBuilder();
         builder.Services.AddSingleton(options);
+        builder.Services.AddSingleton<ApiKeyAuthentication>();
         builder.Services.AddSingleton<UrlStore>(sp =>
             new UrlStore(sp.GetRequiredService<ServiceOptions>().DbPath));
         builder.Services.AddSingleton<RateLimiter>(sp =>
@@ -85,6 +82,8 @@ public static class ShortenerApp
             await next();
         });
 
+        ApiKeyAuthentication.ProtectManagementApi(app);
+
         // ---- health -----------------------------------------------------------
         app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
         app.MapGet("/ready", (HttpContext context) =>
@@ -102,15 +101,7 @@ public static class ShortenerApp
         {
             var store = context.RequestServices.GetRequiredService<UrlStore>();
             var opts = context.RequestServices.GetRequiredService<ServiceOptions>();
-
-            // idempotent replay
-            if (context.Request.Headers.TryGetValue("Idempotency-Key", out var keyValues))
-            {
-                var key = keyValues.ToString();
-                var saved = store.GetIdempotency(key);
-                if (saved is not null)
-                    return Results.Json(JsonSerializer.Deserialize<JsonElement>(saved), statusCode: 200);
-            }
+            var owner = ApiKeyAuthentication.OwnerOf(context);
 
             // validation
             string url;
@@ -137,11 +128,31 @@ public static class ShortenerApp
                 code = string.Empty;
                 for (var i = 0; i < 10; i++)
                 {
-                    var candidate = GenerateCode(RandomNumberGenerator.Create());
+                    var candidate = GenerateCode();
                     if (store.Get(candidate) is null) { code = candidate; break; }
                 }
                 if (string.IsNullOrEmpty(code))
                     return Results.Json(new { detail = "could not allocate a short code" }, statusCode: 500);
+            }
+
+            string? idempotencyKey = null;
+            if (context.Request.Headers.TryGetValue("Idempotency-Key", out var keyValues))
+            {
+                if (keyValues.Count != 1 || string.IsNullOrEmpty(keyValues[0]) || keyValues[0]!.Length > 128 ||
+                    keyValues[0]!.Any(c => c < '!' || c > '~'))
+                    return Results.Json(new { detail = "Idempotency-Key must be 1–128 printable ASCII characters without spaces" }, statusCode: 400);
+                idempotencyKey = keyValues[0];
+            }
+            var requestHash = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                url, custom_alias = string.IsNullOrEmpty(body.CustomAlias) ? null : body.CustomAlias,
+                expires_in_days = body.ExpiresInDays,
+            })));
+            if (idempotencyKey is not null && store.GetIdempotency(owner, idempotencyKey) is { } saved)
+            {
+                if (saved.RequestHash != requestHash)
+                    return Results.Json(new { detail = "Idempotency-Key was already used with a different request" }, statusCode: 422);
+                return Results.Json(JsonSerializer.Deserialize<JsonElement>(saved.Body), statusCode: 200);
             }
 
             // persistence
@@ -159,68 +170,56 @@ public static class ShortenerApp
                 CreatedAt = createdAt,
                 ExpiresAt = expiresAt,
             };
-            var bodyJson = JsonSerializer.Serialize(payload,
-                new JsonSerializerOptions
-                {
-                    PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-                    DictionaryKeyPolicy = JsonNamingPolicy.SnakeCaseLower,
-                });
+            var bodyJson = JsonSerializer.Serialize(payload, JsonOptions);
 
             // The database transaction resolves concurrent requests with the same key.
-            var idempotencyKey = context.Request.Headers.TryGetValue("Idempotency-Key", out var keyValues2)
-                ? keyValues2.ToString() : null;
-            var result = store.CreateWithIdempotency(code, url, createdAt, expiresAt, idempotencyKey, bodyJson);
-            if (result.Replay is not null)
-                return Results.Json(JsonSerializer.Deserialize<JsonElement>(result.Replay), statusCode: 200);
-            if (!result.Created)
-                return Results.Json(new { detail = "custom alias already in use" }, statusCode: 409);
+            var result = store.CreateWithIdempotency(code, url, createdAt, expiresAt, owner, idempotencyKey, requestHash, bodyJson);
+            if (result.Outcome == CreateUrlOutcome.IdempotencyConflict)
+                return Results.Json(new { detail = "Idempotency-Key was already used with a different request" }, statusCode: 422);
+            if (result.Outcome == CreateUrlOutcome.Replay)
+                return Results.Json(JsonSerializer.Deserialize<JsonElement>(result.Replay!), statusCode: 200);
+            if (result.Outcome == CreateUrlOutcome.CodeConflict)
+                return Results.Json(new { detail = "short code already in use; retry with a new code" }, statusCode: 409);
 
-            return Results.Json(JsonSerializer.Deserialize<JsonElement>(bodyJson), statusCode: 201);
+            return Results.Json(payload, JsonOptions, statusCode: 201);
         });
 
         // ---- list / get / delete / stats -----------------------------------------
         app.MapGet("/api/urls", (HttpContext context) =>
         {
             var store = context.RequestServices.GetRequiredService<UrlStore>();
-            var rows = store.ListAll();
-            return Results.Ok(rows.Select(r => new UrlRecordDto
-            {
-                Code = r.Code, Url = r.Url, CreatedAt = r.CreatedAt,
-                ExpiresAt = r.ExpiresAt, Clicks = store.ClickCount(r.Code),
-            }).ToList());
+            return Results.Ok(store.ListOwned(ApiKeyAuthentication.OwnerOf(context)));
         });
 
         app.MapGet("/api/urls/{code}/stats", (HttpContext context, string code) =>
         {
             var store = context.RequestServices.GetRequiredService<UrlStore>();
-            if (store.Get(code) is null)
+            var owner = ApiKeyAuthentication.OwnerOf(context);
+            if (store.GetOwned(code, owner) is null)
                 return Results.Json(new { detail = "unknown code" }, statusCode: 404);
             // NOTE: no DictionaryKeyPolicy — referrer / user-agent breakdown keys
             // are returned verbatim (matches the API contract).
-            return Results.Json(ClickAnalytics.BuildStats(code, store.ClicksFor(code)),
-                new JsonSerializerOptions
-                {
-                    PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-                });
+            return Results.Json(ClickAnalytics.BuildStats(code, store.ClicksFor(code, owner)), JsonOptions);
         });
 
         app.MapGet("/api/urls/{code}", (HttpContext context, string code) =>
         {
             var store = context.RequestServices.GetRequiredService<UrlStore>();
-            var row = store.Get(code);
+            var owner = ApiKeyAuthentication.OwnerOf(context);
+            var row = store.GetOwned(code, owner);
             if (row is null)
                 return Results.Json(new { detail = "unknown code" }, statusCode: 404);
             return Results.Ok(new UrlRecordDto
             {
                 Code = row.Code, Url = row.Url, CreatedAt = row.CreatedAt,
-                ExpiresAt = row.ExpiresAt, Clicks = store.ClickCount(row.Code),
+                ExpiresAt = row.ExpiresAt, Clicks = store.ClickCount(row.Code, owner),
             });
         });
 
         app.MapDelete("/api/urls/{code}", (HttpContext context, string code) =>
         {
             var store = context.RequestServices.GetRequiredService<UrlStore>();
-            if (!store.Delete(code))
+            if (!store.DeleteOwned(code, ApiKeyAuthentication.OwnerOf(context)))
                 return Results.Json(new { detail = "unknown code" }, statusCode: 404);
             return Results.NoContent();
         });

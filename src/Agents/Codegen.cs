@@ -56,6 +56,8 @@ public sealed class ShortenerOptions
     public double RatePerMinute { get; set; } = 60.0;
     public int RateBurst { get; set; } = 10;
     public string[] TrustedProxies { get; set; } = Array.Empty<string>();
+    // Stable owner ID -> secret API key. Empty configuration disables management access.
+    public Dictionary<string, string> ApiKeys { get; set; } = new(StringComparer.Ordinal);
 
     public static ShortenerOptions FromEnvironment() => new()
     {
@@ -67,7 +69,30 @@ public sealed class ShortenerOptions
                                  out var burst) ? burst : 10,
         TrustedProxies = (Environment.GetEnvironmentVariable(""SHORTENER_TRUSTED_PROXIES"") ?? """")
             .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries),
+        ApiKeys = ReadApiKeys(Environment.GetEnvironmentVariable(""SHORTENER_API_KEYS"")),
     };
+
+    public static Dictionary<string, string> ReadApiKeys(string? configuration)
+    {
+        var keys = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(configuration)) return keys;
+        try
+        {
+            using var document = System.Text.Json.JsonDocument.Parse(configuration);
+            if (document.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+                throw new FormatException();
+            foreach (var property in document.RootElement.EnumerateObject())
+                if (property.Value.ValueKind != System.Text.Json.JsonValueKind.String ||
+                    !keys.TryAdd(property.Name, property.Value.GetString()!))
+                    throw new FormatException();
+        }
+        catch (Exception exc) when (exc is System.Text.Json.JsonException or FormatException)
+        {
+            // Never include secret configuration in startup errors.
+            throw new InvalidOperationException(""SHORTENER_API_KEYS must be a JSON object mapping unique owner IDs to API keys."");
+        }
+        return keys;
+    }
 }
 ";
 
@@ -76,10 +101,11 @@ public sealed class ShortenerOptions
     // =======================================================================
     private const string ModelsCs = @"// Data models for the URL shortener API.
 // JSON is serialized snake_case (short_url, created_at, ...) to preserve the
-// API contract; see Program.cs HTTP JSON configuration.
+// API contract; see ShortenerApp HTTP JSON configuration.
 
 namespace Shortener;
 
+/// <summary>POST /api/urls request body.</summary>
 public sealed class CreateUrlRequest
 {
     public string Url { get; set; } = string.Empty;
@@ -87,6 +113,7 @@ public sealed class CreateUrlRequest
     public int? ExpiresInDays { get; set; }
 }
 
+/// <summary>POST /api/urls response body.</summary>
 public sealed class ShortUrlResponse
 {
     public string Code { get; set; } = string.Empty;
@@ -96,6 +123,7 @@ public sealed class ShortUrlResponse
     public string? ExpiresAt { get; set; }
 }
 
+/// <summary>A stored short URL plus its click count.</summary>
 public sealed class UrlRecordDto
 {
     public string Code { get; set; } = string.Empty;
@@ -111,6 +139,7 @@ public sealed class DayCount
     public int Count { get; set; }
 }
 
+/// <summary>GET /api/urls/{code}/stats response body.</summary>
 public sealed class UrlStats
 {
     public string Code { get; set; } = string.Empty;
@@ -121,8 +150,13 @@ public sealed class UrlStats
     public string? LastClickedAt { get; set; }
 }
 
+// ---- storage rows ----
 public sealed record UrlRow(string Code, string Url, string CreatedAt, string? ExpiresAt);
 public sealed record ClickRow(string Code, string Ts, string? Referrer, string? UserAgent, string? Ip);
+
+public enum CreateUrlOutcome { Created, Replay, CodeConflict, IdempotencyConflict }
+public sealed record CreateUrlResult(CreateUrlOutcome Outcome, string? Replay = null);
+public sealed record IdempotencyRecord(string RequestHash, string Body);
 ";
 
     // =======================================================================
@@ -162,7 +196,8 @@ public static class Validators
         if (string.IsNullOrEmpty(alias) || !AliasRegex.IsMatch(alias))
             throw new ArgumentException(""custom_alias must be 3-32 chars of [A-Za-z0-9_-]"");
         if (alias.Equals(""health"", StringComparison.OrdinalIgnoreCase) ||
-            alias.Equals(""ready"", StringComparison.OrdinalIgnoreCase))
+            alias.Equals(""ready"", StringComparison.OrdinalIgnoreCase) ||
+            alias.Equals(""api"", StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException(""custom_alias is reserved for a service endpoint"");
         return alias;
     }
@@ -182,14 +217,15 @@ using Microsoft.Data.Sqlite;
 
 namespace Shortener;
 
-public sealed class UrlStore
+public sealed class UrlStore : IDisposable
 {
     private const string Schema = @""
 CREATE TABLE IF NOT EXISTS urls (
   code        TEXT PRIMARY KEY,
   url         TEXT NOT NULL,
   created_at  TEXT NOT NULL,
-  expires_at  TEXT
+  expires_at  TEXT,
+  owner_id    TEXT
 );
 CREATE TABLE IF NOT EXISTS clicks (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -200,36 +236,69 @@ CREATE TABLE IF NOT EXISTS clicks (
   ip          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_clicks_code_ts ON clicks (code, ts);
-CREATE TABLE IF NOT EXISTS idempotency (
-  key         TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS idempotency_requests (
+  owner_id    TEXT NOT NULL,
+  key         TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
   body        TEXT NOT NULL,
-  created_at  TEXT NOT NULL
-);"";
+  expires_at  INTEGER NOT NULL,
+  PRIMARY KEY(owner_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_idempotency_expiry ON idempotency_requests (expires_at);"";
 
     private readonly string _dbPath;
     private readonly object _lock = new();
     private SqliteConnection? _conn;
     private bool _initialized;
+    private bool _disposed;
+    private readonly TimeProvider _timeProvider;
+    public static readonly TimeSpan IdempotencyRetention = TimeSpan.FromHours(24);
 
-    public UrlStore(string dbPath)
+    public UrlStore(string dbPath, TimeProvider? timeProvider = null)
     {
         _dbPath = dbPath;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     // -- schema ----------------------------------------------------------
     private void Ensure()
     {
         // Lazy connection: constructing the store never creates DB files.
-        if (_initialized) return;
         lock (_lock)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (_initialized) return;
-            _conn = new SqliteConnection($""Data Source={_dbPath}"");
-            _conn.Open();
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = Schema;
-            cmd.ExecuteNonQuery();
-            _initialized = true;
+            var connection = new SqliteConnection($""Data Source={_dbPath};Pooling=False"");
+            try
+            {
+                connection.Open();
+                // Serialize schema migration across instances using the same database.
+                using var transaction = connection.BeginTransaction(deferred: false);
+                using var cmd = connection.CreateCommand();
+                cmd.Transaction = transaction;
+                cmd.CommandText = Schema;
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = ""PRAGMA table_info(urls)"";
+                bool hasOwner = false;
+                using (var columns = cmd.ExecuteReader())
+                    while (columns.Read()) hasOwner |= columns.GetString(1) == ""owner_id"";
+                if (!hasOwner)
+                {
+                    cmd.CommandText = ""ALTER TABLE urls ADD COLUMN owner_id TEXT"";
+                    cmd.ExecuteNonQuery();
+                }
+                cmd.CommandText = ""CREATE INDEX IF NOT EXISTS idx_urls_owner ON urls (owner_id, created_at)"";
+                cmd.ExecuteNonQuery();
+                transaction.Commit();
+                // Legacy links remain unowned; legacy unscoped idempotency rows are never replayed.
+                _conn = connection;
+                _initialized = true;
+            }
+            catch
+            {
+                connection.Dispose();
+                throw;
+            }
         }
     }
 
@@ -251,18 +320,19 @@ CREATE TABLE IF NOT EXISTS idempotency (
 
     // -- urls ------------------------------------------------------------
     /// <summary>Insert a short URL. Returns false on code collision.</summary>
-    public bool Create(string code, string url, string createdAt, string? expiresAt = null)
+    public bool Create(string code, string url, string createdAt, string? expiresAt = null, string? ownerId = null)
     {
         lock (_lock)
         {
             try
             {
                 using var cmd = Conn.CreateCommand();
-                cmd.CommandText = ""INSERT INTO urls(code, url, created_at, expires_at) VALUES ($code, $url, $created, $expires)"";
+                cmd.CommandText = ""INSERT INTO urls(code, url, created_at, expires_at, owner_id) VALUES ($code, $url, $created, $expires, $owner)"";
                 cmd.Parameters.AddWithValue(""$code"", code);
                 cmd.Parameters.AddWithValue(""$url"", url);
                 cmd.Parameters.AddWithValue(""$created"", createdAt);
                 cmd.Parameters.AddWithValue(""$expires"", (object?)expiresAt ?? DBNull.Value);
+                cmd.Parameters.AddWithValue(""$owner"", (object?)ownerId ?? DBNull.Value);
                 cmd.ExecuteNonQuery();
                 return true;
             }
@@ -288,6 +358,41 @@ CREATE TABLE IF NOT EXISTS idempotency (
         }
     }
 
+    public UrlRow? GetOwned(string code, string ownerId)
+    {
+        lock (_lock)
+        {
+            using var cmd = Conn.CreateCommand();
+            cmd.CommandText = ""SELECT code, url, created_at, expires_at FROM urls WHERE code = $code AND owner_id = $owner"";
+            cmd.Parameters.AddWithValue(""$code"", code);
+            cmd.Parameters.AddWithValue(""$owner"", ownerId);
+            using var reader = cmd.ExecuteReader();
+            return reader.Read() ? new UrlRow(reader.GetString(0), reader.GetString(1), reader.GetString(2),
+                reader.IsDBNull(3) ? null : reader.GetString(3)) : null;
+        }
+    }
+
+    public List<UrlRecordDto> ListOwned(string ownerId)
+    {
+        lock (_lock)
+        {
+            using var cmd = Conn.CreateCommand();
+            cmd.CommandText = @""SELECT u.code, u.url, u.created_at, u.expires_at, COUNT(c.id)
+FROM urls u LEFT JOIN clicks c ON c.code = u.code
+WHERE u.owner_id = $owner GROUP BY u.code ORDER BY u.created_at DESC"";
+            cmd.Parameters.AddWithValue(""$owner"", ownerId);
+            using var reader = cmd.ExecuteReader();
+            var rows = new List<UrlRecordDto>();
+            while (reader.Read())
+                rows.Add(new UrlRecordDto
+                {
+                    Code = reader.GetString(0), Url = reader.GetString(1), CreatedAt = reader.GetString(2),
+                    ExpiresAt = reader.IsDBNull(3) ? null : reader.GetString(3), Clicks = reader.GetInt32(4),
+                });
+            return rows;
+        }
+    }
+
     public List<UrlRow> ListAll()
     {
         lock (_lock)
@@ -303,18 +408,26 @@ CREATE TABLE IF NOT EXISTS idempotency (
         }
     }
 
-    public bool Delete(string code)
+    public bool DeleteOwned(string code, string ownerId)
     {
         lock (_lock)
         {
+            using var transaction = Conn.BeginTransaction(deferred: false);
             using var cmd = Conn.CreateCommand();
-            cmd.CommandText = ""DELETE FROM urls WHERE code = $code"";
+            cmd.Transaction = transaction;
+            cmd.CommandText = ""DELETE FROM urls WHERE code = $code AND owner_id = $owner"";
             cmd.Parameters.AddWithValue(""$code"", code);
+            cmd.Parameters.AddWithValue(""$owner"", ownerId);
             var deleted = cmd.ExecuteNonQuery();
-            using var cmd2 = Conn.CreateCommand();
-            cmd2.CommandText = ""DELETE FROM clicks WHERE code = $code"";
-            cmd2.Parameters.AddWithValue(""$code"", code);
-            cmd2.ExecuteNonQuery();
+            if (deleted > 0)
+            {
+                using var cmd2 = Conn.CreateCommand();
+                cmd2.Transaction = transaction;
+                cmd2.CommandText = ""DELETE FROM clicks WHERE code = $code"";
+                cmd2.Parameters.AddWithValue(""$code"", code);
+                cmd2.ExecuteNonQuery();
+            }
+            transaction.Commit();
             return deleted > 0;
         }
     }
@@ -335,13 +448,16 @@ CREATE TABLE IF NOT EXISTS idempotency (
         }
     }
 
-    public List<ClickRow> ClicksFor(string code)
+    public List<ClickRow> ClicksFor(string code, string? ownerId = null)
     {
         lock (_lock)
         {
             using var cmd = Conn.CreateCommand();
-            cmd.CommandText = ""SELECT code, ts, referrer, user_agent, ip FROM clicks WHERE code = $code ORDER BY ts"";
+            cmd.CommandText = @""SELECT c.code, c.ts, c.referrer, c.user_agent, c.ip FROM clicks c
+WHERE c.code = $code AND ($owner IS NULL OR EXISTS
+    (SELECT 1 FROM urls u WHERE u.code = c.code AND u.owner_id = $owner)) ORDER BY c.ts"";
             cmd.Parameters.AddWithValue(""$code"", code);
+            cmd.Parameters.AddWithValue(""$owner"", (object?)ownerId ?? DBNull.Value);
             using var reader = cmd.ExecuteReader();
             var rows = new List<ClickRow>();
             while (reader.Read())
@@ -353,90 +469,112 @@ CREATE TABLE IF NOT EXISTS idempotency (
         }
     }
 
-    public int ClickCount(string code)
+    public int ClickCount(string code, string? ownerId = null)
     {
         lock (_lock)
         {
             using var cmd = Conn.CreateCommand();
-            cmd.CommandText = ""SELECT COUNT(*) FROM clicks WHERE code = $code"";
+            cmd.CommandText = @""SELECT COUNT(*) FROM clicks c WHERE c.code = $code AND
+($owner IS NULL OR EXISTS (SELECT 1 FROM urls u WHERE u.code = c.code AND u.owner_id = $owner))"";
             cmd.Parameters.AddWithValue(""$code"", code);
+            cmd.Parameters.AddWithValue(""$owner"", (object?)ownerId ?? DBNull.Value);
             return Convert.ToInt32(cmd.ExecuteScalar());
         }
     }
 
     // -- idempotency -----------------------------------------------------
     /// <summary>Atomically create the URL and save its replay response across connections.</summary>
-    public (bool Created, string? Replay) CreateWithIdempotency(
-        string code, string url, string createdAt, string? expiresAt, string? key, string body)
+    public CreateUrlResult CreateWithIdempotency(
+        string code, string url, string createdAt, string? expiresAt, string ownerId,
+        string? key, string requestHash, string body)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(ownerId);
         lock (_lock)
         {
             if (key is null)
-                return (Create(code, url, createdAt, expiresAt), null);
+                return new(Create(code, url, createdAt, expiresAt, ownerId)
+                    ? CreateUrlOutcome.Created : CreateUrlOutcome.CodeConflict);
 
             // Acquire the write reservation before reading the key. A second connection
             // waits here and then observes the committed replay instead of creating a URL.
             using var transaction = Conn.BeginTransaction(deferred: false);
+            var now = _timeProvider.GetUtcNow();
+            using var cleanup = Conn.CreateCommand();
+            cleanup.Transaction = transaction;
+            cleanup.CommandText = ""DELETE FROM idempotency_requests WHERE expires_at <= $now"";
+            cleanup.Parameters.AddWithValue(""$now"", now.ToUnixTimeSeconds());
+            cleanup.ExecuteNonQuery();
             using var lookup = Conn.CreateCommand();
             lookup.Transaction = transaction;
-            lookup.CommandText = ""SELECT body FROM idempotency WHERE key = $key"";
+            lookup.CommandText = ""SELECT request_hash, body FROM idempotency_requests WHERE owner_id = $owner AND key = $key"";
+            lookup.Parameters.AddWithValue(""$owner"", ownerId);
             lookup.Parameters.AddWithValue(""$key"", key);
-            if (lookup.ExecuteScalar() is string saved)
+            IdempotencyRecord? saved = null;
+            using (var reader = lookup.ExecuteReader())
+                if (reader.Read()) saved = new(reader.GetString(0), reader.GetString(1));
+            if (saved is not null)
             {
                 transaction.Commit();
-                return (false, saved);
+                return saved.RequestHash == requestHash
+                    ? new(CreateUrlOutcome.Replay, saved.Body) : new(CreateUrlOutcome.IdempotencyConflict);
             }
 
             try
             {
                 using var insert = Conn.CreateCommand();
                 insert.Transaction = transaction;
-                insert.CommandText = ""INSERT INTO urls(code, url, created_at, expires_at) VALUES ($code, $url, $created, $expires)"";
+                insert.CommandText = ""INSERT INTO urls(code, url, created_at, expires_at, owner_id) VALUES ($code, $url, $created, $expires, $owner)"";
                 insert.Parameters.AddWithValue(""$code"", code);
                 insert.Parameters.AddWithValue(""$url"", url);
                 insert.Parameters.AddWithValue(""$created"", createdAt);
                 insert.Parameters.AddWithValue(""$expires"", (object?)expiresAt ?? DBNull.Value);
+                insert.Parameters.AddWithValue(""$owner"", ownerId);
                 insert.ExecuteNonQuery();
 
                 using var save = Conn.CreateCommand();
                 save.Transaction = transaction;
-                save.CommandText = ""INSERT INTO idempotency(key, body, created_at) VALUES ($key, $body, $created)"";
+                save.CommandText = @""INSERT INTO idempotency_requests(owner_id, key, request_hash, body, expires_at)
+VALUES ($owner, $key, $hash, $body, $expires)"";
+                save.Parameters.AddWithValue(""$owner"", ownerId);
                 save.Parameters.AddWithValue(""$key"", key);
+                save.Parameters.AddWithValue(""$hash"", requestHash);
                 save.Parameters.AddWithValue(""$body"", body);
-                save.Parameters.AddWithValue(""$created"", createdAt);
+                save.Parameters.AddWithValue(""$expires"", now.Add(IdempotencyRetention).ToUnixTimeSeconds());
                 save.ExecuteNonQuery();
                 transaction.Commit();
-                return (true, null);
+                return new(CreateUrlOutcome.Created);
             }
             catch (SqliteException ex) when (ex.SqliteErrorCode == 19)
             {
                 // Disposing the transaction rolls back both inserts on a collision.
-                return (false, null);
+                return new(CreateUrlOutcome.CodeConflict);
             }
         }
     }
 
-    public void SaveIdempotency(string key, string body, string createdAt)
+    public IdempotencyRecord? GetIdempotency(string ownerId, string key)
     {
         lock (_lock)
         {
             using var cmd = Conn.CreateCommand();
-            cmd.CommandText = ""INSERT OR IGNORE INTO idempotency(key, body, created_at) VALUES ($key, $body, $created)"";
+            cmd.CommandText = @""SELECT request_hash, body FROM idempotency_requests
+WHERE owner_id = $owner AND key = $key AND expires_at > $now"";
+            cmd.Parameters.AddWithValue(""$owner"", ownerId);
             cmd.Parameters.AddWithValue(""$key"", key);
-            cmd.Parameters.AddWithValue(""$body"", body);
-            cmd.Parameters.AddWithValue(""$created"", createdAt);
-            cmd.ExecuteNonQuery();
+            cmd.Parameters.AddWithValue(""$now"", _timeProvider.GetUtcNow().ToUnixTimeSeconds());
+            using var reader = cmd.ExecuteReader();
+            return reader.Read() ? new(reader.GetString(0), reader.GetString(1)) : null;
         }
     }
 
-    public string? GetIdempotency(string key)
+    public void Dispose()
     {
         lock (_lock)
         {
-            using var cmd = Conn.CreateCommand();
-            cmd.CommandText = ""SELECT body FROM idempotency WHERE key = $key"";
-            cmd.Parameters.AddWithValue(""$key"", key);
-            return cmd.ExecuteScalar() as string;
+            if (_disposed) return;
+            _disposed = true;
+            _conn?.Dispose();
+            _conn = null;
         }
     }
 }
@@ -563,12 +701,82 @@ public sealed class RateLimiter
     // NOTE: the catch-all ``/{code}`` redirect route is registered LAST so it
     // can never shadow /health, /ready, or /api/* routes.
     // =======================================================================
-    private const string ProgramCs = @"// URL shortener service — workspace build (variant v2).
-// Generated by the implementer agent from the reviewed codegen spec.
-
-using System.Globalization;
+    private const string ApiKeyAuthenticationCs = @"using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
+
+namespace Shortener;
+
+/// <summary>Authenticate management API callers without storing their secrets in the database.</summary>
+public sealed class ApiKeyAuthentication
+{
+    public const string HeaderName = ""X-Api-Key"";
+    private readonly List<(string Owner, byte[] Hash)> _credentials = new();
+    public bool IsConfigured => _credentials.Count > 0;
+
+    public ApiKeyAuthentication(ShortenerOptions options)
+    {
+        var uniqueKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var (owner, secret) in options.ApiKeys)
+        {
+            if (string.IsNullOrWhiteSpace(owner) || owner.Length > 128 || owner.Trim() != owner ||
+                string.IsNullOrEmpty(secret) || secret.Length is < 32 or > 512 ||
+                secret.Any(c => c < '!' || c > '~') || !uniqueKeys.Add(secret))
+                throw new InvalidOperationException(
+                    ""API keys must be unique, 32–512 printable ASCII characters, with nonempty owner IDs of at most 128 characters."");
+            _credentials.Add((owner, SHA256.HashData(Encoding.UTF8.GetBytes(secret))));
+        }
+    }
+
+    public string? Authenticate(string? secret)
+    {
+        if (string.IsNullOrEmpty(secret) || secret.Length > 512) return null;
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(secret));
+        string? owner = null;
+        foreach (var credential in _credentials)
+            if (CryptographicOperations.FixedTimeEquals(hash, credential.Hash))
+                owner = credential.Owner;
+        return owner;
+    }
+
+    public static string OwnerOf(HttpContext context) =>
+        context.User.FindFirst(ClaimTypes.NameIdentifier)?.Value
+        ?? throw new InvalidOperationException(""Authenticated owner is required."");
+
+    public static void ProtectManagementApi(WebApplication app)
+    {
+        // Validate configured credentials at startup; no anonymous management fallback.
+        var authentication = app.Services.GetRequiredService<ApiKeyAuthentication>();
+        app.Use(async (context, next) =>
+        {
+            if (context.Request.Path.StartsWithSegments(""/api""))
+            {
+                if (!authentication.IsConfigured)
+                {
+                    context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                    await context.Response.WriteAsJsonAsync(new { detail = ""API authentication is not configured"" });
+                    return;
+                }
+                var values = context.Request.Headers[HeaderName];
+                var owner = values.Count == 1 ? authentication.Authenticate(values[0]) : null;
+                if (owner is null)
+                {
+                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                    context.Response.Headers.WWWAuthenticate = ""ApiKey"";
+                    await context.Response.WriteAsJsonAsync(new { detail = ""a valid API key is required"" });
+                    return;
+                }
+                context.User = new ClaimsPrincipal(new ClaimsIdentity(
+                    new[] { new Claim(ClaimTypes.NameIdentifier, owner) }, ""ApiKey""));
+            }
+            await next();
+        });
+    }
+}
+";
+
+    private const string ProgramCs = @"using System.Globalization;
+using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.AspNetCore.HttpOverrides;
 using Shortener;
@@ -578,10 +786,12 @@ app.Run();
 
 WebApplication CreateApp(ShortenerOptions? options = null)
 {
+    var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
     options ??= ShortenerOptions.FromEnvironment();
 
     var builder = WebApplication.CreateBuilder();
     builder.Services.AddSingleton(options);
+    builder.Services.AddSingleton<ApiKeyAuthentication>();
     builder.Services.AddSingleton<UrlStore>(sp =>
         new UrlStore(sp.GetRequiredService<ShortenerOptions>().DbPath));
     builder.Services.AddSingleton<RateLimiter>(sp =>
@@ -618,6 +828,7 @@ WebApplication CreateApp(ShortenerOptions? options = null)
     string? Referrer(HttpContext c) =>
         c.Request.Headers.TryGetValue(""Referer"", out var r) ? r.ToString() : null;
 
+    // ---- rate limiting (health/ready bypass) -----------------------------
     app.Use(async (context, next) =>
     {
         var path = context.Request.Path.Value ?? string.Empty;
@@ -636,6 +847,9 @@ WebApplication CreateApp(ShortenerOptions? options = null)
         await next();
     });
 
+    ApiKeyAuthentication.ProtectManagementApi(app);
+
+    // ---- health -----------------------------------------------------------
     app.MapGet(""/health"", () => Results.Ok(new { status = ""ok"" }));
     app.MapGet(""/ready"", (HttpContext context) =>
     {
@@ -647,19 +861,14 @@ WebApplication CreateApp(ShortenerOptions? options = null)
             statusCode: db == ""ok"" ? 200 : 503);
     });
 
+    // ---- create short URL ---------------------------------------------------
     app.MapPost(""/api/urls"", (HttpContext context, CreateUrlRequest body) =>
     {
         var store = context.RequestServices.GetRequiredService<UrlStore>();
         var opts = context.RequestServices.GetRequiredService<ShortenerOptions>();
+        var owner = ApiKeyAuthentication.OwnerOf(context);
 
-        if (context.Request.Headers.TryGetValue(""Idempotency-Key"", out var keyValues))
-        {
-            var key = keyValues.ToString();
-            var saved = store.GetIdempotency(key);
-            if (saved is not null)
-                return Results.Json(JsonSerializer.Deserialize<JsonElement>(saved), statusCode: 200);
-        }
-
+        // validation
         string url;
         try { url = Validators.ValidateUrl(body.Url); }
         catch (ArgumentException exc)
@@ -690,6 +899,27 @@ WebApplication CreateApp(ShortenerOptions? options = null)
                 return Results.Json(new { detail = ""could not allocate a short code"" }, statusCode: 500);
         }
 
+        string? idempotencyKey = null;
+        if (context.Request.Headers.TryGetValue(""Idempotency-Key"", out var keyValues))
+        {
+            if (keyValues.Count != 1 || string.IsNullOrEmpty(keyValues[0]) || keyValues[0]!.Length > 128 ||
+                keyValues[0]!.Any(c => c < '!' || c > '~'))
+                return Results.Json(new { detail = ""Idempotency-Key must be 1–128 printable ASCII characters without spaces"" }, statusCode: 400);
+            idempotencyKey = keyValues[0];
+        }
+        var requestHash = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            url, custom_alias = string.IsNullOrEmpty(body.CustomAlias) ? null : body.CustomAlias,
+            expires_in_days = body.ExpiresInDays,
+        })));
+        if (idempotencyKey is not null && store.GetIdempotency(owner, idempotencyKey) is { } saved)
+        {
+            if (saved.RequestHash != requestHash)
+                return Results.Json(new { detail = ""Idempotency-Key was already used with a different request"" }, statusCode: 422);
+            return Results.Json(JsonSerializer.Deserialize<JsonElement>(saved.Body), statusCode: 200);
+        }
+
+        // persistence
         var now = DateTime.UtcNow;
         var createdAt = now.ToString(""o"");
         string? expiresAt = null;
@@ -704,69 +934,63 @@ WebApplication CreateApp(ShortenerOptions? options = null)
             CreatedAt = createdAt,
             ExpiresAt = expiresAt,
         };
-        var bodyJson = JsonSerializer.Serialize(payload, new JsonSerializerOptions
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-            DictionaryKeyPolicy = JsonNamingPolicy.SnakeCaseLower,
-        });
+        var bodyJson = JsonSerializer.Serialize(payload, jsonOptions);
 
         // The database transaction resolves concurrent requests with the same key.
-        var idempotencyKey = context.Request.Headers.TryGetValue(""Idempotency-Key"", out var keyValues2)
-            ? keyValues2.ToString() : null;
-        var result = store.CreateWithIdempotency(code, url, createdAt, expiresAt, idempotencyKey, bodyJson);
-        if (result.Replay is not null)
-            return Results.Json(JsonSerializer.Deserialize<JsonElement>(result.Replay), statusCode: 200);
-        if (!result.Created)
-            return Results.Json(new { detail = ""custom alias already in use"" }, statusCode: 409);
+        var result = store.CreateWithIdempotency(code, url, createdAt, expiresAt, owner, idempotencyKey, requestHash, bodyJson);
+        if (result.Outcome == CreateUrlOutcome.IdempotencyConflict)
+            return Results.Json(new { detail = ""Idempotency-Key was already used with a different request"" }, statusCode: 422);
+        if (result.Outcome == CreateUrlOutcome.Replay)
+            return Results.Json(JsonSerializer.Deserialize<JsonElement>(result.Replay!), statusCode: 200);
+        if (result.Outcome == CreateUrlOutcome.CodeConflict)
+            return Results.Json(new { detail = ""short code already in use; retry with a new code"" }, statusCode: 409);
 
-        return Results.Json(JsonSerializer.Deserialize<JsonElement>(bodyJson), statusCode: 201);
+        return Results.Json(payload, jsonOptions, statusCode: 201);
     });
 
+    // ---- list / get / delete / stats -----------------------------------------
     app.MapGet(""/api/urls"", (HttpContext context) =>
     {
         var store = context.RequestServices.GetRequiredService<UrlStore>();
-        var rows = store.ListAll();
-        return Results.Ok(rows.Select(r => new UrlRecordDto
-        {
-            Code = r.Code, Url = r.Url, CreatedAt = r.CreatedAt,
-            ExpiresAt = r.ExpiresAt, Clicks = store.ClickCount(r.Code),
-        }).ToList());
+        return Results.Ok(store.ListOwned(ApiKeyAuthentication.OwnerOf(context)));
     });
 
     app.MapGet(""/api/urls/{code}/stats"", (HttpContext context, string code) =>
     {
         var store = context.RequestServices.GetRequiredService<UrlStore>();
-        if (store.Get(code) is null)
+        var owner = ApiKeyAuthentication.OwnerOf(context);
+        if (store.GetOwned(code, owner) is null)
             return Results.Json(new { detail = ""unknown code"" }, statusCode: 404);
-        return Results.Json(ClickAnalytics.BuildStats(code, store.ClicksFor(code)),
-            new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower });
         // NOTE: no DictionaryKeyPolicy — referrer / user-agent breakdown keys
         // are returned verbatim (matches the API contract).
+        return Results.Json(ClickAnalytics.BuildStats(code, store.ClicksFor(code, owner)), jsonOptions);
     });
 
     app.MapGet(""/api/urls/{code}"", (HttpContext context, string code) =>
     {
         var store = context.RequestServices.GetRequiredService<UrlStore>();
-        var row = store.Get(code);
+        var owner = ApiKeyAuthentication.OwnerOf(context);
+        var row = store.GetOwned(code, owner);
         if (row is null)
             return Results.Json(new { detail = ""unknown code"" }, statusCode: 404);
         return Results.Ok(new UrlRecordDto
         {
             Code = row.Code, Url = row.Url, CreatedAt = row.CreatedAt,
-            ExpiresAt = row.ExpiresAt, Clicks = store.ClickCount(row.Code),
+            ExpiresAt = row.ExpiresAt, Clicks = store.ClickCount(row.Code, owner),
         });
     });
 
     app.MapDelete(""/api/urls/{code}"", (HttpContext context, string code) =>
     {
         var store = context.RequestServices.GetRequiredService<UrlStore>();
-        if (!store.Delete(code))
+        if (!store.DeleteOwned(code, ApiKeyAuthentication.OwnerOf(context)))
             return Results.Json(new { detail = ""unknown code"" }, statusCode: 404);
         return Results.NoContent();
     });
 
     // -- EXTENSION POINT: smart-link endpoints (ambiguous scenario) --
 
+    // ---- redirect (catch-all, registered last) -----------------------------------
     app.MapGet(""/{code}"", (HttpContext context, string code) =>
     {
         var store = context.RequestServices.GetRequiredService<UrlStore>();
@@ -781,21 +1005,14 @@ WebApplication CreateApp(ShortenerOptions? options = null)
                           Referrer(context),
                           context.Request.Headers.UserAgent.ToString(),
                           ClientIp(context));
-        return Results.Redirect(row.Url, preserveMethod: true);
+        return Results.Redirect(row.Url, preserveMethod: true); // 307 Temporary Redirect
     });
 
     return app;
 }
 
-static string GenerateCode(int length = 7)
-{
-    const string alphabet = ""abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"";
-    var sb = new StringBuilder(length);
-    var bytes = new byte[length];
-    RandomNumberGenerator.Fill(bytes);
-    foreach (var b in bytes) sb.Append(alphabet[b % alphabet.Length]);
-    return sb.ToString();
-}
+static string GenerateCode(int length = 7) =>
+    RandomNumberGenerator.GetString(""abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"", length);
 
 // Exposed for WebApplicationFactory in tests.
 public partial class Program { }
@@ -843,6 +1060,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -851,10 +1069,15 @@ using Xunit;
 
 public sealed class ShortenerTestFactory : WebApplicationFactory<Program>
 {
+    public const string TestKey = ""test-only-key-0123456789-abcdefghijklmnopqrstuvwxyz"";
+    private readonly bool _authenticate;
     private readonly ShortenerOptions _options;
+    private readonly IPAddress? _remoteIp;
 
-    public ShortenerTestFactory(ShortenerOptions? options = null)
+    public ShortenerTestFactory(ShortenerOptions? options = null, IPAddress? remoteIp = null, bool authenticate = true)
     {
+        _authenticate = authenticate;
+        _remoteIp = remoteIp;
         _options = options ?? new ShortenerOptions
         {
             DbPath = "":memory:"",
@@ -862,16 +1085,80 @@ public sealed class ShortenerTestFactory : WebApplicationFactory<Program>
             RatePerMinute = 6000,
             RateBurst = 1000,
         };
+        if (authenticate) _options.ApiKeys[""test-owner""] = TestKey;
+    }
+
+    protected override void ConfigureClient(HttpClient client)
+    {
+        base.ConfigureClient(client);
+        if (_authenticate) client.DefaultRequestHeaders.Add(ApiKeyAuthentication.HeaderName, TestKey);
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
-        builder.ConfigureServices(services => services.AddSingleton(_options));
+        builder.ConfigureServices(services =>
+        {
+            services.AddSingleton(_options);
+            if (_remoteIp is not null)
+                services.AddSingleton<IStartupFilter>(new RemoteIpFilter(_remoteIp));
+        });
     }
+}
+
+file sealed class RemoteIpFilter(IPAddress address) : IStartupFilter
+{
+    public Action<Microsoft.AspNetCore.Builder.IApplicationBuilder> Configure(Action<Microsoft.AspNetCore.Builder.IApplicationBuilder> next) => app =>
+    {
+        app.Use((context, nextMiddleware) =>
+        {
+            context.Connection.RemoteIpAddress = address;
+            return nextMiddleware();
+        });
+        next(app);
+    };
 }
 
 public sealed class ServiceTests : IDisposable
 {
+    [Fact]
+    public async Task ManagementRequiresApiKey()
+    {
+        using var client = Client();
+        client.DefaultRequestHeaders.Remove(ApiKeyAuthentication.HeaderName);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync(""/api/urls"")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync(""/health"")).StatusCode);
+    }
+
+    [Fact]
+    public async Task OtherOwnerCannotReadOrDeleteLink()
+    {
+        using var factory = new ShortenerTestFactory(new ShortenerOptions
+        {
+            DbPath = "":memory:"", RateBurst = 1000,
+            ApiKeys = new() { [""other-owner""] = ""other-test-only-key-0123456789-abcdefghijklmnopqrstuvwxyz"" },
+        });
+        using var first = factory.CreateClient();
+        var code = CodeOf(await (await first.PostAsJsonAsync(""/api/urls"", new { url = ""https://example.com"" })).Content.ReadAsStringAsync());
+        using var other = factory.CreateClient();
+        other.DefaultRequestHeaders.Remove(ApiKeyAuthentication.HeaderName);
+        other.DefaultRequestHeaders.Add(ApiKeyAuthentication.HeaderName, ""other-test-only-key-0123456789-abcdefghijklmnopqrstuvwxyz"");
+        Assert.Empty((await other.GetFromJsonAsync<JsonElement>(""/api/urls"")).EnumerateArray());
+        Assert.Equal(HttpStatusCode.NotFound, (await other.GetAsync($""/api/urls/{code}"")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await other.GetAsync($""/api/urls/{code}/stats"")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await other.DeleteAsync($""/api/urls/{code}"")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await first.GetAsync($""/api/urls/{code}"")).StatusCode);
+    }
+
+    [Fact]
+    public async Task IdempotencyRejectsChangedRequest()
+    {
+        using var client = Client();
+        client.DefaultRequestHeaders.Add(""Idempotency-Key"", ""request-match"");
+        Assert.Equal(HttpStatusCode.Created, (await client.PostAsJsonAsync(""/api/urls"", new { url = ""https://example.com"" })).StatusCode);
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, (await client.PostAsJsonAsync(""/api/urls"", new { url = ""https://other.example"" })).StatusCode);
+        Assert.Single(_factory.Services.GetRequiredService<UrlStore>().ListAll());
+    }
+
     private readonly ShortenerTestFactory _factory = new();
 
     public void Dispose() => _factory.Dispose();
@@ -1031,7 +1318,7 @@ public sealed class ServiceTests : IDisposable
         var client = Client();
         var code = CodeOf(await (await client.PostAsJsonAsync(""/api/urls"",
             new { url = ""https://example.com/"" })).Content.ReadAsStringAsync());
-        Assert.Contains(code, client.GetAsync(""/api/urls"").Result.Content.ReadAsStringAsync().Result);
+        Assert.Contains(code, await (await client.GetAsync(""/api/urls"")).Content.ReadAsStringAsync());
         var get = Body(await (await client.GetAsync($""/api/urls/{code}"")).Content.ReadAsStringAsync());
         Assert.Equal(""https://example.com/"", get.GetProperty(""url"").GetString());
         Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync(""/api/urls/missing"")).StatusCode);
@@ -1173,7 +1460,7 @@ public sealed class ServiceTests : IDisposable
         var client = Client();
         var code = CodeOf(await (await client.PostAsJsonAsync(""/api/urls"",
             new { url = ""https://example.com/"" })).Content.ReadAsStringAsync());
-        Assert.Contains(code, client.GetAsync(""/api/urls"").Result.Content.ReadAsStringAsync().Result);
+        Assert.Contains(code, await (await client.GetAsync(""/api/urls"")).Content.ReadAsStringAsync());
         Assert.Equal(HttpStatusCode.NoContent, (await client.DeleteAsync($""/api/urls/{code}"")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync($""/api/urls/{code}"")).StatusCode);
     }
@@ -1254,6 +1541,7 @@ public sealed class ServiceTests : IDisposable
             {
                 var content = spec.Content.Replace(
                     "    public string? CustomAlias { get; set; }\n", "");
+                content = content.Replace("string.IsNullOrEmpty(body.CustomAlias) ? null : body.CustomAlias", "(string?)null");
                 result.Add(new FileSpec(spec.Path, content));
             }
             else if (spec.Path == "Shortener/Program.cs")
@@ -1320,6 +1608,7 @@ public sealed class ServiceTests : IDisposable
                             $"v1 patch anchor not found exactly once in Program.cs: {oldText[..60]}");
                     content = content.Replace(oldText, newText);
                 }
+                content = content.Replace("string.IsNullOrEmpty(body.CustomAlias) ? null : body.CustomAlias", "(string?)null");
                 result.Add(new FileSpec(spec.Path, content));
             }
             else
@@ -1473,7 +1762,7 @@ public static class SmartLinks
     app.MapGet(""/api/urls/{code}/health"", (HttpContext context, string code) =>
     {
         var store = context.RequestServices.GetRequiredService<UrlStore>();
-        var row = store.Get(code);
+        var row = store.GetOwned(code, ApiKeyAuthentication.OwnerOf(context));
         if (row is null)
             return Results.Json(new { detail = ""unknown code"" }, statusCode: 404);
         var result = new Dictionary<string, object?> { [""code""] = code };
@@ -1487,7 +1776,7 @@ public static class SmartLinks
     app.MapGet(""/api/urls/{code}/health"", (HttpContext context, string code) =>
     {
         var store = context.RequestServices.GetRequiredService<UrlStore>();
-        var row = store.Get(code);
+        var row = store.GetOwned(code, ApiKeyAuthentication.OwnerOf(context));
         if (row is null)
             return Results.Json(new { detail = ""unknown code"" }, statusCode: 404);
         var result = new Dictionary<string, object?> { [""code""] = code };
@@ -1514,6 +1803,17 @@ using Xunit;
 
 public sealed class SmartTests : IDisposable
 {
+    [Fact]
+    public async Task HealthEndpointRequiresLinkOwnership()
+    {
+        using var client = Client();
+        var store = _factory.Services.GetRequiredService<UrlStore>();
+        store.Create(""other-owned"", ""http://127.0.0.1:9/x"", DateTime.UtcNow.ToString(""o""), ownerId: ""someone-else"");
+        Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync(""/api/urls/other-owned/health"")).StatusCode);
+        client.DefaultRequestHeaders.Remove(ApiKeyAuthentication.HeaderName);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync(""/api/urls/other-owned/health"")).StatusCode);
+    }
+
     private readonly ShortenerTestFactory _factory = new();
 
     public void Dispose() => _factory.Dispose();
@@ -1616,6 +1916,7 @@ public sealed class SmartTests : IDisposable
         {
             new("Shortener/Shortener.csproj", ShortenerCsproj),
             new("Shortener/ShortenerOptions.cs", ShortenerOptionsCs),
+            new("Shortener/ApiKeyAuthentication.cs", ApiKeyAuthenticationCs),
             new("Shortener/Models.cs", ModelsCs),
             new("Shortener/Validators.cs", ValidatorsCs),
             new("Shortener/UrlStore.cs", UrlStoreCs),

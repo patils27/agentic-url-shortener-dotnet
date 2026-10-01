@@ -52,3 +52,7 @@ public sealed class UrlStats
 // ---- storage rows ----
 public sealed record UrlRow(string Code, string Url, string CreatedAt, string? ExpiresAt);
 public sealed record ClickRow(string Code, string Ts, string? Referrer, string? UserAgent, string? Ip);
+
+public enum CreateUrlOutcome { Created, Replay, CodeConflict, IdempotencyConflict }
+public sealed record CreateUrlResult(CreateUrlOutcome Outcome, string? Replay = null);
+public sealed record IdempotencyRecord(string RequestHash, string Body);

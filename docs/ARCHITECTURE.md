@@ -17,7 +17,8 @@ An ASP.NET Core (minimal API) URL shortener with SQLite persistence via
 |---|---|
 | `ShortenerApp.cs` | Route definitions and app factory `ShortenerApp.CreateApp(ServiceOptions?)`; catch-all `/{code}` registered **last** so it never shadows `/health`, `/ready`, or `/api/*` |
 | `Models.cs` | Request/response records (`CreateUrlRequest`, `ShortUrlResponse`, `UrlStats`, `ClickRow`, `UrlRow`) |
-| `UrlStore.cs` | SQLite layer (single connection guarded by a lock; tables created lazily; tables `urls`, `clicks`, `idempotency`) |
+| `UrlStore.cs` | SQLite layer (single connection guarded by a lock; lazy schema migration; tables `urls`, `clicks`, `idempotency_requests`) |
+| `ApiKeyAuthentication.cs` | API-key authentication for `/api/*`; stable owner claims, hashed constant-time key comparison, fail-closed configuration |
 | `ClickAnalytics.cs` | Pure-function click aggregation (totals, per-day, referrer/user-agent breakdown, `last_clicked_at`) |
 | `RateLimiter.cs` | Per-IP token-bucket limiter (in-memory, thread-safe; default 60 req/min, burst 10); `429` carries `Retry-After`; `/health` and `/ready` bypass it |
 | `Validators.cs` | Shared URL/alias validation (mirrors the v2 refactor that extracted validators from the app layer) |
@@ -31,6 +32,12 @@ body), `GET /{code}` (307 redirect, records click),
 check, returns `db: ok|error`). All JSON is snake_case
 (`JsonNamingPolicy.SnakeCaseLower`); referrer/user-agent breakdown keys
 are returned verbatim per the API contract.
+
+Management queries are owner-scoped, including analytics and generated smart-link
+health endpoints. Idempotency uses an atomic transaction and a composite
+`(owner_id, key)` primary key, a validated-request hash, and 24-hour retention.
+Old unscoped replay data is never served. See [API access](API_ACCESS.md) for setup
+and migration behavior.
 
 ### 1.2 The orchestrator (`src/Orchestrator/`)
 

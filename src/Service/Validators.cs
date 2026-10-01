@@ -31,7 +31,8 @@ public static class Validators
         if (string.IsNullOrEmpty(alias) || !AliasRegex.IsMatch(alias))
             throw new ArgumentException("custom_alias must be 3-32 chars of [A-Za-z0-9_-]");
         if (alias.Equals("health", StringComparison.OrdinalIgnoreCase) ||
-            alias.Equals("ready", StringComparison.OrdinalIgnoreCase))
+            alias.Equals("ready", StringComparison.OrdinalIgnoreCase) ||
+            alias.Equals("api", StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException("custom_alias is reserved for a service endpoint");
         return alias;
     }
