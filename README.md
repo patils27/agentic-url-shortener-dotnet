@@ -161,6 +161,104 @@ recorded in the audit log). Run bundles land in
 `runs/<scenario>/<run-id>/`. Details in
 [docs/FINAL_SUMMARY.md](docs/FINAL_SUMMARY.md).
 
+### Scenario workflows
+
+These diagrams follow the task dependencies defined in
+[PlannerAgent.cs](src/Agents/PlannerAgent.cs). Before each workflow, the planner
+analyzes and normalizes the requirement and creates the scenario's task plan.
+The orchestration engine then executes that plan.
+
+Solid arrows mean a task must finish before the next task can run. Separate
+branches can run in parallel when their entry gates pass. Labels show the work
+and the responsible agent. Release requires passing tests, documentation, no
+policy violations, a rollback plan, and approval; it does not deploy to production.
+
+#### Greenfield: build v1 from scratch
+
+Architecture comes first. Implementation, test writing, and documentation can
+then proceed in parallel. Test execution waits for all implementation branches
+and the test suite; release also waits for documentation.
+
+```mermaid
+flowchart TD
+    architect["Architecture and design<br/>Architect"]
+    impl_models["Models and storage<br/>Implementer"]
+    impl_api["API and middleware<br/>Implementer"]
+    impl_analytics["Analytics and rate limiting<br/>Implementer"]
+    write_tests["Write service tests<br/>Implementer"]
+    write_docs["Write API documentation<br/>Documenter"]
+    run_tests["Run xUnit suite<br/>Tester"]
+    release["Release checks and approval<br/>Release"]
+
+    architect --> impl_models
+    architect --> impl_api
+    architect --> impl_analytics
+    architect --> write_tests
+    architect --> write_docs
+    impl_models --> run_tests
+    impl_api --> run_tests
+    impl_analytics --> run_tests
+    write_tests --> run_tests
+    run_tests --> release
+    write_docs --> release
+```
+
+#### Brownfield: enhance an existing v1 service
+
+The scenario first materializes a v1 baseline. Impact analysis identifies the
+affected modules, then implementation, regression-test writing, and changelog
+updates can proceed in parallel. The v2 changes add aliases, fix expired-link
+responses from 404 to 410, and extract shared validators.
+
+```mermaid
+flowchart TD
+    analyze_impact["Analyze affected modules<br/>Architect"]
+    implement_changes["Apply enhancement, fix, and refactor<br/>Implementer"]
+    add_regression_tests["Write regression tests<br/>Implementer"]
+    update_changelog["Update changelog<br/>Documenter"]
+    run_tests["Run full xUnit suite<br/>Tester"]
+    release["Release checks and approval<br/>Release"]
+
+    analyze_impact --> implement_changes
+    analyze_impact --> add_regression_tests
+    analyze_impact --> update_changelog
+    implement_changes --> run_tests
+    add_regression_tests --> run_tests
+    run_tests --> release
+    update_changelog --> release
+```
+
+#### Ambiguous: clarify the scope and re-plan
+
+Starting from a v2 baseline, the planner records assumptions about "make short
+links smarter." Design, implementation, and tests initially use that hypothesis.
+An approval checkpoint then applies a predefined simulated stakeholder
+clarification, which changes the scope and queues a re-plan.
+
+```mermaid
+flowchart TD
+    clarify["Record hypothesis and assumptions<br/>Planner"]
+    design_smart["Design smart-link feature<br/>Architect"]
+    implement_smart["Implement smart-link feature<br/>Implementer"]
+    test_smart["Test smart-link feature<br/>Tester"]
+    await_clarification["Clarification approval checkpoint<br/>Planner"]
+    document["Document assumptions and API<br/>Documenter"]
+    release["Release checks and approval<br/>Release"]
+
+    clarify --> design_smart
+    design_smart --> implement_smart
+    implement_smart --> test_smart
+    test_smart --> await_clarification
+    await_clarification --> document
+    document --> release
+    await_clarification -.->|Scope changed: re-plan once| clarify
+```
+
+The dotted arrow represents an engine re-plan request, not a dependency edge in
+the task DAG. The engine invalidates `clarify` and its downstream tasks and runs
+them again. On that second pass, the planner preserves the confirmed requirement
+and skips reinjecting clarification, allowing documentation and release to finish.
+
 ## Repository layout
 
 ```
