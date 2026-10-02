@@ -125,6 +125,8 @@ public sealed class ServiceTests : IDisposable
     [InlineData("HEALTH")]
     [InlineData("ready")]
     [InlineData("ReAdY")]
+    [InlineData("swagger")]
+    [InlineData("SwAgGeR")]
     public async Task ReservedAliasesAreRejected(string alias)
     {
         var response = await Client().PostAsJsonAsync("/api/urls",

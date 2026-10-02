@@ -190,7 +190,8 @@ public sealed class PlannerAgent : Agent
                 new Dictionary<string, object?>(impl)
                     { ["files"] = new List<string> { "Shortener/Program.cs",
                         "Shortener/ShortenerOptions.cs", "Shortener/ApiKeyAuthentication.cs", "Shortener/UrlService.cs",
-                        "Shortener/ApiExceptionHandler.cs", "Shortener/RequestCorrelationMiddleware.cs" } },
+                        "Shortener/ApiExceptionHandler.cs", "Shortener/RequestCorrelationMiddleware.cs",
+                        "Shortener/SwaggerDocumentation.cs" } },
                 deps: new() { "architect" }, entryGates: new() { "architecture_decided" }),
             Spec("impl_analytics", "implementer", "Implement analytics + rate limiting",
                 new Dictionary<string, object?>(impl)

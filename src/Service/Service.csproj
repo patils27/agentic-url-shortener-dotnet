@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.7" />
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="10.2.3" />
     <!-- Pin above the vulnerable transitive version (NU1903 advisory GHSA-2m69-gcr7-jv3q). -->
     <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.13" />
   </ItemGroup>

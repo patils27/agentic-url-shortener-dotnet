@@ -32,6 +32,7 @@ public static class Codegen
 
   <ItemGroup>
     <PackageReference Include=""Microsoft.Data.Sqlite"" Version=""10.0.7"" />
+    <PackageReference Include=""Swashbuckle.AspNetCore"" Version=""10.2.3"" />
     <PackageReference Include=""SQLitePCLRaw.lib.e_sqlite3"" Version=""2.1.13"" />
   </ItemGroup>
 
@@ -199,7 +200,8 @@ public static class Validators
             throw new ArgumentException(""custom_alias must be 3-32 chars of [A-Za-z0-9_-]"");
         if (alias.Equals(""health"", StringComparison.OrdinalIgnoreCase) ||
             alias.Equals(""ready"", StringComparison.OrdinalIgnoreCase) ||
-            alias.Equals(""api"", StringComparison.OrdinalIgnoreCase))
+            alias.Equals(""api"", StringComparison.OrdinalIgnoreCase) ||
+            alias.Equals(""swagger"", StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException(""custom_alias is reserved for a service endpoint"");
         return alias;
     }
@@ -999,19 +1001,227 @@ public sealed class RequestCorrelationMiddleware(RequestDelegate next, ILogger<R
 }
 ";
 
+    private const string SwaggerDocumentationCs = @"using Microsoft.OpenApi;
+using Swashbuckle.AspNetCore.SwaggerGen;
+
+namespace Shortener;
+
+public static class SwaggerDocumentation
+{
+    public static IServiceCollection AddApiDocumentation(this IServiceCollection services)
+    {
+        services.AddEndpointsApiExplorer();
+        services.AddSwaggerGen(options =>
+        {
+            options.SwaggerDoc(""v1"", new OpenApiInfo
+            {
+                Title = ""URL Shortener API"",
+                Version = ""v1"",
+                Description = ""Configure SHORTENER_API_KEYS on the server, then use Authorize to enter your key. "" +
+                    ""Management endpoints require X-Api-Key. Health checks and redirects are public."",
+            });
+            options.AddSecurityDefinition(""ApiKey"", new OpenApiSecurityScheme
+            {
+                Type = SecuritySchemeType.ApiKey,
+                In = ParameterLocation.Header,
+                Name = ApiKeyAuthentication.HeaderName,
+                Description = ""Enter the API key only, without a Bearer prefix."",
+            });
+            options.DocumentFilter<ManagementApiDocumentFilter>();
+        });
+        // Use the minimal API's serializer settings so schemas match its snake_case payloads.
+        services.AddSingleton<ISerializerDataContractResolver>(sp => new JsonSerializerDataContractResolver(
+            sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Microsoft.AspNetCore.Http.Json.JsonOptions>>()
+                .Value.SerializerOptions));
+        return services;
+    }
+
+    public static void UseApiDocumentation(this WebApplication app)
+    {
+        if (!app.Environment.IsDevelopment()) return;
+
+        app.UseSwagger();
+        app.UseSwaggerUI(options =>
+        {
+            options.SwaggerEndpoint(""v1/swagger.json"", ""URL Shortener API v1"");
+            options.DocumentTitle = ""URL Shortener API"";
+            // Use bundled assets only and do not send the document to an external validator.
+            options.ConfigObject.ValidatorUrl = null;
+            options.ConfigObject.PersistAuthorization = false;
+        });
+        app.MapGet(""/"", () => Results.Redirect(""swagger/index.html"")).ExcludeFromDescription();
+    }
+}
+
+/// <summary>Describe the same /api boundary enforced by API-key middleware.</summary>
+public sealed class ManagementApiDocumentFilter : IDocumentFilter
+{
+    public void Apply(OpenApiDocument document, DocumentFilterContext context)
+    {
+        foreach (var (path, item) in document.Paths)
+        {
+            if (!path.StartsWith(""/api/"", StringComparison.OrdinalIgnoreCase) || item.Operations is null)
+                continue;
+            foreach (var operation in item.Operations.Values)
+            {
+                operation.Security = [new OpenApiSecurityRequirement
+                {
+                    [new OpenApiSecuritySchemeReference(""ApiKey"", document)] = [],
+                }];
+                operation.Responses ??= new OpenApiResponses();
+                operation.Responses.TryAdd(""401"", new OpenApiResponse { Description = ""Missing or invalid API key."" });
+                operation.Responses.TryAdd(""503"", new OpenApiResponse { Description = ""Authentication is not configured or storage is unavailable."" });
+                operation.Responses.TryAdd(""429"", new OpenApiResponse { Description = ""Rate limit exceeded. Retry after the Retry-After header interval."" });
+            }
+        }
+
+        if (document.Paths.TryGetValue(""/api/urls"", out var urls) &&
+            urls.Operations?.TryGetValue(HttpMethod.Post, out var create) == true)
+        {
+            create.Parameters ??= [];
+            create.Parameters.Add(new OpenApiParameter
+            {
+                Name = ""Idempotency-Key"",
+                In = ParameterLocation.Header,
+                Required = false,
+                Description = ""Optional replay key scoped to your owner. Reusing it with changed input returns 422."",
+                Schema = new OpenApiSchema { Type = JsonSchemaType.String, MinLength = 1, MaxLength = 128 },
+            });
+        }
+    }
+}
+";
+
+    private const string SwaggerTestsCs = @"using System.Net;
+using System.Net.Http.Json;
+using System.Text.Json;
+using Shortener;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Xunit;
+
+public sealed class SwaggerTests
+{
+    [Fact]
+    public async Task DevelopmentServesBundledUiAndRedirectsHomeWithoutAuthentication()
+    {
+        using var factory = new ShortenerTestFactory(authenticate: false);
+        using var development = factory.WithWebHostBuilder(builder => builder.UseEnvironment(""Development""));
+        using var client = development.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+        using var home = await client.GetAsync(""/"");
+        Assert.Equal(HttpStatusCode.Redirect, home.StatusCode);
+        Assert.Equal(""swagger/index.html"", home.Headers.Location?.OriginalString);
+        foreach (var path in new[] { ""/swagger/index.html"", ""/swagger/swagger-ui-bundle.js"", ""/swagger/swagger-ui.css"" })
+        {
+            using var response = await client.GetAsync(path);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.NotEmpty(await response.Content.ReadAsStringAsync());
+        }
+    }
+
+    [Theory]
+    [InlineData(""/"")]
+    [InlineData(""/swagger/index.html"")]
+    [InlineData(""/swagger/v1/swagger.json"")]
+    public async Task ProductionDoesNotExposeDocumentation(string path)
+    {
+        using var factory = new ShortenerTestFactory(authenticate: false);
+        using var production = factory.WithWebHostBuilder(builder => builder.UseEnvironment(""Production""));
+        using var client = production.CreateClient();
+        using var response = await client.GetAsync(path);
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task DocumentDescribesActualPayloadsResponsesAndManagementOnlySecurity()
+    {
+        using var factory = new ShortenerTestFactory();
+        using var development = factory.WithWebHostBuilder(builder => builder.UseEnvironment(""Development""));
+        using var client = development.CreateClient();
+        using var response = await client.GetAsync(""/swagger/v1/swagger.json"");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var text = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain(ShortenerTestFactory.TestKey, text);
+        using var json = JsonDocument.Parse(text);
+        var document = json.RootElement;
+        var scheme = document.GetProperty(""components"").GetProperty(""securitySchemes"").GetProperty(""ApiKey"");
+        Assert.Equal(""apiKey"", scheme.GetProperty(""type"").GetString());
+        Assert.Equal(""header"", scheme.GetProperty(""in"").GetString());
+        Assert.Equal(ApiKeyAuthentication.HeaderName, scheme.GetProperty(""name"").GetString());
+        var paths = document.GetProperty(""paths"");
+        Assert.False(paths.TryGetProperty(""/"", out _));
+        foreach (var path in paths.EnumerateObject())
+        foreach (var operation in path.Value.EnumerateObject())
+        {
+            if (path.Name.StartsWith(""/api/"", StringComparison.Ordinal))
+            {
+                Assert.True(operation.Value.GetProperty(""security"")[0].TryGetProperty(""ApiKey"", out _));
+                Assert.True(operation.Value.GetProperty(""responses"").TryGetProperty(""401"", out _));
+                Assert.True(operation.Value.GetProperty(""responses"").TryGetProperty(""503"", out _));
+            }
+            else
+                Assert.True(!operation.Value.TryGetProperty(""security"", out var security) || security.GetArrayLength() == 0);
+        }
+        var create = paths.GetProperty(""/api/urls"").GetProperty(""post"");
+        Assert.Contains(create.GetProperty(""parameters"").EnumerateArray(),
+            parameter => parameter.GetProperty(""name"").GetString() == ""Idempotency-Key"" &&
+                parameter.GetProperty(""in"").GetString() == ""header"");
+        foreach (var status in new[] { ""200"", ""201"", ""400"", ""409"", ""422"" })
+            Assert.True(create.GetProperty(""responses"").TryGetProperty(status, out _));
+        Assert.True(paths.GetProperty(""/api/urls/{code}"").GetProperty(""delete"").GetProperty(""responses"").TryGetProperty(""204"", out _));
+        Assert.True(paths.GetProperty(""/{code}"").GetProperty(""get"").GetProperty(""responses"").TryGetProperty(""307"", out _));
+        var schemas = document.GetProperty(""components"").GetProperty(""schemas"");
+        var request = schemas.GetProperty(""CreateUrlRequest"").GetProperty(""properties"");
+        Assert.True(request.TryGetProperty(""url"", out _));
+        Assert.True(request.TryGetProperty(""expires_in_days"", out _));
+        Assert.False(request.TryGetProperty(""expiresInDays"", out _));
+        Assert.True(schemas.GetProperty(""ShortUrlResponse"").GetProperty(""properties"").TryGetProperty(""short_url"", out _));
+    }
+
+    [Fact]
+    public async Task DocumentationDoesNotBypassApiAuthentication()
+    {
+        using var factory = new ShortenerTestFactory();
+        using var development = factory.WithWebHostBuilder(builder => builder.UseEnvironment(""Development""));
+        using var client = development.CreateClient();
+        client.DefaultRequestHeaders.Remove(ApiKeyAuthentication.HeaderName);
+        using var unauthorized = await client.GetAsync(""/api/urls"");
+        Assert.Equal(HttpStatusCode.Unauthorized, unauthorized.StatusCode);
+        client.DefaultRequestHeaders.Add(ApiKeyAuthentication.HeaderName, ShortenerTestFactory.TestKey);
+        using var created = await client.PostAsJsonAsync(""/api/urls"", new { url = ""https://example.com"" });
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        using var listed = await client.GetAsync(""/api/urls"");
+        Assert.Equal(HttpStatusCode.OK, listed.StatusCode);
+    }
+
+    [Fact]
+    public async Task DocumentationIsAvailableWhenApiKeysHaveNotBeenConfigured()
+    {
+        using var factory = new ShortenerTestFactory(authenticate: false);
+        using var development = factory.WithWebHostBuilder(builder => builder.UseEnvironment(""Development""));
+        using var client = development.CreateClient();
+        using var documentation = await client.GetAsync(""/swagger/v1/swagger.json"");
+        Assert.Equal(HttpStatusCode.OK, documentation.StatusCode);
+        using var management = await client.GetAsync(""/api/urls"");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, management.StatusCode);
+    }
+}
+";
+
     private const string ProgramCs = @"using System.Text.Json;
 using Microsoft.AspNetCore.HttpOverrides;
 using Shortener;
 
-var app = CreateApp(ShortenerOptions.FromEnvironment());
+var app = CreateApp(ShortenerOptions.FromEnvironment(), args);
 app.Run();
 
-WebApplication CreateApp(ShortenerOptions? options = null)
+WebApplication CreateApp(ShortenerOptions? options = null, string[]? args = null)
 {
     var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
     options ??= ShortenerOptions.FromEnvironment();
 
-    var builder = WebApplication.CreateBuilder();
+    var builder = WebApplication.CreateBuilder(args ?? Array.Empty<string>());
+    builder.Services.AddApiDocumentation();
     builder.Services.AddProblemDetails();
     builder.Services.AddExceptionHandler<ApiExceptionHandler>();
     builder.Services.Configure<Microsoft.AspNetCore.Routing.RouteHandlerOptions>(o => o.ThrowOnBadRequest = true);
@@ -1047,6 +1257,8 @@ WebApplication CreateApp(ShortenerOptions? options = null)
         {
             [""correlation_id""] = statusContext.HttpContext.TraceIdentifier,
         }).ExecuteAsync(statusContext.HttpContext));
+
+    app.UseApiDocumentation();
 
     var trustedProxies = app.Services.GetRequiredService<ShortenerOptions>().TrustedProxies;
     if (trustedProxies.Length > 0)
@@ -1092,12 +1304,14 @@ WebApplication CreateApp(ShortenerOptions? options = null)
     ApiKeyAuthentication.ProtectManagementApi(app);
 
     // HTTP handlers bind requests and map business outcomes to the API contract.
-    app.MapGet(""/health"", () => Results.Ok(new { status = ""ok"" }));
+    app.MapGet(""/health"", () => Results.Ok(new { status = ""ok"" }))
+        .WithSummary(""Check application liveness"").WithTags(""Health"");
     app.MapGet(""/ready"", (UrlService service) =>
     {
         service.CheckReady();
         return Results.Ok(new { status = ""ready"", db = ""ok"" });
-    }).WithMetadata(new ReadinessEndpoint());
+    }).WithMetadata(new ReadinessEndpoint())
+        .WithSummary(""Check database readiness"").WithTags(""Health"").Produces(200).Produces(503);
 
     app.MapPost(""/api/urls"", (HttpContext context, CreateUrlRequest body, UrlService service) =>
     {
@@ -1120,10 +1334,13 @@ WebApplication CreateApp(ShortenerOptions? options = null)
             UrlCreationStatus.AllocationFailed => Results.Json(new { detail = result.Error }, statusCode: 500),
             _ => throw new InvalidOperationException(""Unknown URL creation outcome.""),
         };
-    });
+    }).WithSummary(""Create a short URL"").WithTags(""URLs"")
+        .Produces<ShortUrlResponse>(201).Produces<ShortUrlResponse>(200)
+        .Produces(400).Produces(409).Produces(422).Produces(500);
 
     app.MapGet(""/api/urls"", (HttpContext context, UrlService service) =>
-        Results.Ok(service.List(ApiKeyAuthentication.OwnerOf(context))));
+        Results.Ok(service.List(ApiKeyAuthentication.OwnerOf(context))))
+        .WithSummary(""List your short URLs"").WithTags(""URLs"").Produces<List<UrlRecordDto>>();
 
     app.MapGet(""/api/urls/{code}/stats"", (HttpContext context, string code, UrlService service) =>
     {
@@ -1132,17 +1349,20 @@ WebApplication CreateApp(ShortenerOptions? options = null)
         return stats is null
             ? Results.Json(new { detail = ""unknown code"" }, statusCode: 404)
             : Results.Json(stats, jsonOptions);
-    });
+    }).WithSummary(""Get click statistics for your short URL"").WithTags(""URLs"")
+        .Produces<UrlStats>().Produces(404);
 
     app.MapGet(""/api/urls/{code}"", (HttpContext context, string code, UrlService service) =>
     {
         var row = service.GetOwned(code, ApiKeyAuthentication.OwnerOf(context));
         return row is null ? Results.NotFound(new { detail = ""unknown code"" }) : Results.Ok(row);
-    });
+    }).WithSummary(""Get one of your short URLs"").WithTags(""URLs"")
+        .Produces<UrlRecordDto>().Produces(404);
 
     app.MapDelete(""/api/urls/{code}"", (HttpContext context, string code, UrlService service) =>
         service.Delete(code, ApiKeyAuthentication.OwnerOf(context))
-            ? Results.NoContent() : Results.NotFound(new { detail = ""unknown code"" }));
+            ? Results.NoContent() : Results.NotFound(new { detail = ""unknown code"" }))
+        .WithSummary(""Delete one of your short URLs"").WithTags(""URLs"").Produces(204).Produces(404);
 
     // -- EXTENSION POINT: smart-link endpoints (ambiguous scenario) --
 
@@ -1158,7 +1378,8 @@ WebApplication CreateApp(ShortenerOptions? options = null)
             RedirectStatus.Found => Results.Redirect(result.Destination!, preserveMethod: true),
             _ => throw new InvalidOperationException(""Unknown redirect outcome.""),
         };
-    });
+    }).WithSummary(""Follow a short URL and record a click"").WithTags(""Redirects"")
+        .Produces(307).Produces(404).Produces(StatusCodes.Status410Gone);
 
     return app;
 }
@@ -1879,7 +2100,8 @@ public sealed class ServiceTests : IDisposable
             else if (spec.Path == "Shortener/Program.cs")
                 content = ReplaceOnce(content,
                     @"RedirectStatus.Expired => Results.Json(new { detail = ""link expired"" }, statusCode: 410)",
-                    @"RedirectStatus.Expired => Results.Json(new { detail = ""link expired"" }, statusCode: 404)");
+                    @"RedirectStatus.Expired => Results.Json(new { detail = ""link expired"" }, statusCode: 404)")
+                    .Replace(".Produces(StatusCodes.Status410Gone)", "");
             result.Add(new(spec.Path, content));
         }
         if (result.Any(spec => spec.Path is "Shortener/Models.cs" or "Shortener/UrlService.cs" &&
@@ -2191,6 +2413,8 @@ public sealed class SmartTests : IDisposable
             new("Shortener/RateLimiter.cs", RateLimiterCs),
             new("Shortener/ApiExceptionHandler.cs", ApiExceptionHandlerCs),
             new("Shortener/RequestCorrelationMiddleware.cs", RequestCorrelationMiddlewareCs),
+            new("Shortener/SwaggerDocumentation.cs", SwaggerDocumentationCs),
+            new("Shortener.Tests/SwaggerTests.cs", SwaggerTestsCs),
             new("Shortener/Program.cs", ProgramCs),
             new("Shortener.Tests/Shortener.Tests.csproj", TestsCsproj),
             new("Shortener.Tests/ExceptionHandlingTests.cs", ExceptionHandlingTestsCs),

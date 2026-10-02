@@ -41,6 +41,21 @@ An already-running Visual Studio instance will not inherit newly set variables.
 Set `src/Service` as the startup project and use F5. The API client must still
 send `X-Api-Key` while debugging. Existing launch settings were not changed.
 
+## Use Swagger UI
+
+With the HTTPS Development profile, browse to `https://localhost:7084/swagger`.
+For the HTTP profile, use `http://localhost:5038/swagger`. The Development root
+page redirects there automatically. Configure `SHORTENER_API_KEYS` before
+starting the service, then use **Authorize** in Swagger UI to enter the matching
+key without a prefix. Management operations send it in `X-Api-Key`; public
+health and redirect operations do not require it. Keys are not persisted across
+page reloads or embedded in the OpenAPI document.
+
+Use **Try it out** and **Execute** to call an endpoint. Swagger UI remains
+accessible in Development even when no server keys are configured, but it does
+not bypass authentication or create credentials. Swagger endpoints are disabled
+outside Development.
+
 ## Configuration and errors
 
 `SHORTENER_API_KEYS` is a JSON object, for example

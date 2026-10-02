@@ -15,11 +15,12 @@ public static class ShortenerApp
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
     };
 
-    public static WebApplication CreateApp(ServiceOptions? options = null)
+    public static WebApplication CreateApp(ServiceOptions? options = null, string[]? args = null)
     {
         options ??= ServiceOptions.FromEnvironment();
 
-        var builder = WebApplication.CreateBuilder();
+        var builder = WebApplication.CreateBuilder(args ?? Array.Empty<string>());
+        builder.Services.AddApiDocumentation();
         builder.Services.AddProblemDetails();
         builder.Services.AddExceptionHandler<ApiExceptionHandler>();
         builder.Services.Configure<Microsoft.AspNetCore.Routing.RouteHandlerOptions>(o => o.ThrowOnBadRequest = true);
@@ -55,6 +56,8 @@ public static class ShortenerApp
             {
                 ["correlation_id"] = statusContext.HttpContext.TraceIdentifier,
             }).ExecuteAsync(statusContext.HttpContext));
+
+        app.UseApiDocumentation();
 
         var trustedProxies = app.Services.GetRequiredService<ServiceOptions>().TrustedProxies;
         if (trustedProxies.Length > 0)
@@ -100,12 +103,14 @@ public static class ShortenerApp
         ApiKeyAuthentication.ProtectManagementApi(app);
 
         // HTTP handlers bind requests and map business outcomes to the API contract.
-        app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+        app.MapGet("/health", () => Results.Ok(new { status = "ok" }))
+            .WithSummary("Check application liveness").WithTags("Health");
         app.MapGet("/ready", (UrlService service) =>
         {
             service.CheckReady();
             return Results.Ok(new { status = "ready", db = "ok" });
-        }).WithMetadata(new ReadinessEndpoint());
+        }).WithMetadata(new ReadinessEndpoint())
+            .WithSummary("Check database readiness").WithTags("Health").Produces(200).Produces(503);
 
         app.MapPost("/api/urls", (HttpContext context, CreateUrlRequest body, UrlService service) =>
         {
@@ -128,10 +133,13 @@ public static class ShortenerApp
                 UrlCreationStatus.AllocationFailed => Results.Json(new { detail = result.Error }, statusCode: 500),
                 _ => throw new InvalidOperationException("Unknown URL creation outcome."),
             };
-        });
+        }).WithSummary("Create a short URL").WithTags("URLs")
+            .Produces<ShortUrlResponse>(201).Produces<ShortUrlResponse>(200)
+            .Produces(400).Produces(409).Produces(422).Produces(500);
 
         app.MapGet("/api/urls", (HttpContext context, UrlService service) =>
-            Results.Ok(service.List(ApiKeyAuthentication.OwnerOf(context))));
+            Results.Ok(service.List(ApiKeyAuthentication.OwnerOf(context))))
+            .WithSummary("List your short URLs").WithTags("URLs").Produces<List<UrlRecordDto>>();
 
         app.MapGet("/api/urls/{code}/stats", (HttpContext context, string code, UrlService service) =>
         {
@@ -140,17 +148,20 @@ public static class ShortenerApp
             return stats is null
                 ? Results.Json(new { detail = "unknown code" }, statusCode: 404)
                 : Results.Json(stats, JsonOptions);
-        });
+        }).WithSummary("Get click statistics for your short URL").WithTags("URLs")
+            .Produces<UrlStats>().Produces(404);
 
         app.MapGet("/api/urls/{code}", (HttpContext context, string code, UrlService service) =>
         {
             var row = service.GetOwned(code, ApiKeyAuthentication.OwnerOf(context));
             return row is null ? Results.NotFound(new { detail = "unknown code" }) : Results.Ok(row);
-        });
+        }).WithSummary("Get one of your short URLs").WithTags("URLs")
+            .Produces<UrlRecordDto>().Produces(404);
 
         app.MapDelete("/api/urls/{code}", (HttpContext context, string code, UrlService service) =>
             service.Delete(code, ApiKeyAuthentication.OwnerOf(context))
-                ? Results.NoContent() : Results.NotFound(new { detail = "unknown code" }));
+                ? Results.NoContent() : Results.NotFound(new { detail = "unknown code" }))
+            .WithSummary("Delete one of your short URLs").WithTags("URLs").Produces(204).Produces(404);
 
         // ---- redirect (catch-all, registered last) -----------------------------------
         app.MapGet("/{code}", (HttpContext context, string code, UrlService service) =>
@@ -164,7 +175,8 @@ public static class ShortenerApp
                 RedirectStatus.Found => Results.Redirect(result.Destination!, preserveMethod: true),
                 _ => throw new InvalidOperationException("Unknown redirect outcome."),
             };
-        });
+        }).WithSummary("Follow a short URL and record a click").WithTags("Redirects")
+            .Produces(307).Produces(404).Produces(StatusCodes.Status410Gone);
 
         return app;
     }

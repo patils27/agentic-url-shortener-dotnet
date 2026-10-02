@@ -42,7 +42,7 @@ All projects target `net10.0`.
 dotnet test AgenticUrlShortener.sln --nologo -v q
 ```
 
-144/144 passing: 87 service cases + 57 orchestrator/agent cases. Generated
+153/153 passing: 96 service cases + 57 orchestrator/agent cases. Generated
 scenario workspaces under `runs/*/workspace/` are ordinary directories
 (not in the solution), so their own suites are never collected by the
 repo test run. Details in [docs/TESTING.md](docs/TESTING.md).
@@ -59,6 +59,31 @@ ASPNETCORE_URLS=http://127.0.0.1:8000 \
 dotnet src/Service/bin/Debug/net10.0/AgenticUrlShortener.Service.dll
 # (build first: dotnet build AgenticUrlShortener.sln --nologo -v q)
 ```
+
+### Swagger UI
+
+In Development, open [Swagger UI](https://localhost:7084/swagger) with the HTTPS
+launch profile, or `http://localhost:5038/swagger` with the HTTP profile.
+The application root `/` redirects to Swagger UI in Development.
+
+1. Configure `SHORTENER_API_KEYS` using the [API access setup](docs/API_ACCESS.md),
+   then start or restart the service.
+2. Click **Authorize**, paste your API key without a `Bearer` prefix, and click
+   **Authorize** in the dialog. The UI sends it as `X-Api-Key` for management calls.
+3. Expand an endpoint, choose **Try it out**, provide its inputs, and click
+   **Execute**. For `POST /api/urls`, use a valid destination, for example:
+
+   ```json
+   { "url": "https://example.com", "expires_in_days": 7 }
+   ```
+
+Swagger UI does not configure server credentials: management calls still return
+503 if `SHORTENER_API_KEYS` is missing, or 401 if the supplied key is invalid.
+Health checks and redirects are public. Authorization is not persisted across
+page reloads. The OpenAPI document is available at `/swagger/v1/swagger.json`.
+Swagger UI and the document are disabled outside Development. Documentation uses
+[Swashbuckle.AspNetCore](https://github.com/domaindrivendev/Swashbuckle.AspNetCore)
+10.2.3 and is included in generated scenario services as well.
 
 ### Configuration
 
@@ -108,7 +133,7 @@ Forwarded IP headers are ignored by default. When using a reverse proxy, set
 `SHORTENER_TRUSTED_PROXIES` to its immediate peer IP address. The service consumes
 one forwarded hop, from the right of the header; the proxy must append or replace
 the client IP. The validated IP is used for both rate limiting and click analytics.
-Aliases `api`, `health` and `ready` are reserved, regardless of case. Concurrent
+Aliases `api`, `health`, `ready` and `swagger` are reserved, regardless of case. Concurrent
 creates with the same owner, idempotency key, and validated request return one
 saved response and create one URL. Changed requests return `422`; replay records
 expire after 24 hours.
@@ -272,8 +297,8 @@ agentic-url-shortener-dotnet/
 │   │                   # Documenter, Release + Codegen (single source of truth)
 │   └── Scenarios/      # greenfield / brownfield / ambiguous CLI runners
 ├── tests/
-│   ├── Service.Tests/      # 37 service cases (HTTP and storage)
-│   └── Orchestrator.Tests/ # 44 orchestrator/agent cases (xUnit)
+│   ├── Service.Tests/      # 96 service cases (API, storage, security, Swagger)
+│   └── Orchestrator.Tests/ # 57 orchestrator/agent cases (xUnit)
 ├── docs/               # ARCHITECTURE.md, TESTING.md, FINAL_SUMMARY.md
 └── runs/               # scenario run bundles + BUILD_LOG.md
 ```

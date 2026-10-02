@@ -1,6 +1,6 @@
 using AgenticUrlShortener.Service;
 
-var app = ShortenerApp.CreateApp();
+var app = ShortenerApp.CreateApp(args: args);
 app.Run();
 
 // Exposed for WebApplicationFactory in tests.

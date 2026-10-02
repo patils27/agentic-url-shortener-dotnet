@@ -28,6 +28,7 @@ An ASP.NET Core (minimal API) URL shortener with SQLite persistence via
 | `Program.cs` | Entry point; `partial class Program` exposed for `WebApplicationFactory` tests |
 | `ApiExceptionHandler.cs` | Centralized exception logging and safe status/Problem Details mapping; see [error handling](ERROR_HANDLING.md) |
 | `RequestCorrelationMiddleware.cs` | Server-generated request ID in response headers and logging scopes |
+| `SwaggerDocumentation.cs` | Development-only Swagger UI and OpenAPI schemas, with API-key authorization for management endpoints |
 
 Endpoints: `POST /api/urls` (201; `Idempotency-Key` replay → 200 same
 body), `GET /{code}` (307 redirect, records click),
